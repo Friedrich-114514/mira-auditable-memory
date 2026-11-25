@@ -101,7 +101,9 @@ time (the anti-fabrication rule).
 Each Memory also starts life with a forgetting-curve strength (see
 decay.py): strength = confidence x salience(source event's mood)
 x (1 + 0.6 x the event's surprise), last_accessed / strength_as_of
-stamped at recorded_at, sunk = false.
+stamped at recorded_at, and the sunk flag set from that strength —
+a memory encoded below the sinking threshold is born sunk, so the
+flag and the band agree from the start.
 
 Usage:
     python build_graph.py [--data data/memories.json] [--store store]
@@ -119,6 +121,7 @@ import relate
 
 from decay import (
     CHAPTER_BREAK_THRESHOLD,
+    SUNK_THRESHOLD,
     emotion_profile,
     event_salience,
     initial_strength,
@@ -239,9 +242,21 @@ def routine_groups(data: dict, event_period: dict,
     A memory joins a bucket when it is an *episode* (facts,
     preferences, plans and secrets keep their own recall paths), is
     not SECRET_LOCKED, and its source event is unsurprising. Buckets
-    are keyed by (chapter, place, pathway); a bucket becomes a
-    routine when it reaches ROUTINE_MIN_GROUP members whose
-    emotion_weights agree within ROUTINE_WEIGHT_SPREAD.
+    are keyed by (chapter, place, pathway); the routine id names all
+    three, so two pathways at one place can never overwrite each
+    other (S4).
+
+    Within a bucket, the group is the largest set of members whose
+    emotion_weights agree within ROUTINE_WEIGHT_SPREAD — found by a
+    deterministic sliding window over the weight-sorted members. A
+    bucket that mixes weights (four joyful afternoons at 1.2, one
+    tender one at 1.5) yields the agreeing majority as the routine
+    instead of being rejected whole (S4); the odd one out simply
+    stays an individual memory. Window ties break by size, then by
+    the earliest first day, then by the lowest starting weight.
+
+    The summary counts *days* (distinct event dates), not members:
+    two memories of one afternoon are one day of the habit.
 
     One pathway is excluded outright: `buried`. A suppressed memory
     must never be summarised — a Routine node naming its days would
@@ -266,15 +281,40 @@ def routine_groups(data: dict, event_period: dict,
 
     groups = {}
     for (pid, place, pathway), members in sorted(buckets.items()):
-        weights = [w for _m, w in members]
         if len(members) < ROUTINE_MIN_GROUP:
             continue
-        if max(weights) - min(weights) > ROUTINE_WEIGHT_SPREAD:
+        # Sliding window over the weight-sorted members: the largest
+        # subset whose weights agree within the spread.
+        ordered = sorted(
+            members,
+            key=lambda mw: (mw[1], mw[0]["recorded_at"], mw[0]["id"]))
+        best = None   # (size, first_date, start_weight, window)
+        for i in range(len(ordered)):
+            j = i
+            while (j + 1 < len(ordered)
+                   and ordered[j + 1][1] - ordered[i][1]
+                   <= ROUTINE_WEIGHT_SPREAD):
+                j += 1
+            window = ordered[i:j + 1]
+            if len(window) < ROUTINE_MIN_GROUP:
+                continue
+            first_date = min(event_by_id[m["source_event"]]["date"]
+                             for m, _w in window)
+            cand = (len(window), first_date, ordered[i][1], window)
+            if (best is None or cand[0] > best[0]
+                    or (cand[0] == best[0] and cand[1] < best[1])
+                    or (cand[0] == best[0] and cand[1] == best[1]
+                        and cand[2] < best[2])):
+                best = cand
+        if best is None:
             continue
-        mems = sorted((m for m, _w in members),
+        chosen = best[3]
+        weights = [w for _m, w in chosen]
+        mems = sorted((m for m, _w in chosen),
                       key=lambda m: m["recorded_at"])
         dates = sorted(event_by_id[m["source_event"]]["date"] for m in mems)
-        rid = f"routine-{pid}-{slugify(place)}"
+        days = sorted(set(dates))
+        rid = f"routine-{pid}-{pathway}-{slugify(place)}"
         period_name = period_by_id[pid]["name"]
         groups[rid] = {
             "id": rid,
@@ -287,8 +327,8 @@ def routine_groups(data: dict, event_period: dict,
             "last_date": dates[-1],
             "text": (
                 f"During {period_name}, visits to {place} settled into "
-                f"a routine: {len(mems)} similar days between "
-                f"{dates[0]} and {dates[-1]}, each one unremarkable on "
+                f"a routine: {len(days)} similar days between "
+                f"{days[0]} and {days[-1]}, each one unremarkable on "
                 f"its own, together a habit."
             ),
             "gist": f"A routine of visits to {place} during {period_name}.",
@@ -416,6 +456,31 @@ def build(data: dict, base_path: str) -> dict:
     base = Path(base_path)
     event_by_id = {e["id"]: e for e in data["events"]}
     event_period, memory_period = assign_periods(data)
+
+    # Consistency (S6): a derived memory's own `source_event` must
+    # name the same event its derivation chain roots at. Filing
+    # follows the chain; encoding (mood, surprise, detail inventory)
+    # reads the memory's source_event — if the two disagreed, the
+    # memory would silently be encoded from one event while filed
+    # under another's chapter, and same-event adjacency could then
+    # link across stores around the bridge. Disagreement is a data
+    # error: refuse to build.
+    mem_by_id = {m["id"]: m for m in data["memories"]}
+    for mem in data["memories"]:
+        head = mem
+        seen = set()
+        while head.get("derived_from_memory"):
+            if head["id"] in seen:
+                raise ValueError(f"derivation cycle at {head['id']}")
+            seen.add(head["id"])
+            head = mem_by_id[head["derived_from_memory"]]
+        if mem["source_event"] != head["source_event"]:
+            raise ValueError(
+                f"memory {mem['id']}: source_event "
+                f"{mem['source_event']!r} disagrees with its derivation "
+                f"chain's root event {head['source_event']!r} "
+                f"(via {head['id']})")
+
     intra_deriv, cross_deriv = route_derivations(data, memory_period)
     intra_by_child = dict(intra_deriv)
     inventories = detail_inventories(data)
@@ -424,7 +489,24 @@ def build(data: dict, base_path: str) -> dict:
     for rid, group in groups.items():
         groups_by_period.setdefault(group["period"], {})[rid] = group
     period_by_id = {p["id"]: p for p in data.get("periods", [])}
-    slugs = {p["id"]: slugify(p["name"]) for p in data.get("periods", [])}
+    # Period directories are named by slug; two period names that
+    # slugify alike ("Chapter A" / "Chapter A!") would otherwise map
+    # to one directory and the second build pass would clear the
+    # first period's store (S6). Disambiguate deterministically with
+    # the period id; the slug is stored on the Period nodes (index
+    # and partition alike), so the Library opens exactly what was
+    # built.
+    slugs = {}
+    _used_slugs = set()
+    for p in data.get("periods", []):
+        slug = slugify(p["name"])
+        if slug in _used_slugs:
+            slug = f"{slug}-{p['id']}"
+        if slug in _used_slugs:
+            raise ValueError(
+                f"period slug collision cannot be resolved: {slug!r}")
+        _used_slugs.add(slug)
+        slugs[p["id"]] = slug
 
     # Chapter breaks, computed once: period id -> opening event id.
     opened_by = {}
@@ -548,7 +630,7 @@ def build(data: dict, base_path: str) -> dict:
                 "emotion_weight: $weight, surprise: $surprise, "
                 "strength: $strength, encoded_strength: $strength, "
                 "salience: $salience, last_accessed: $recorded_at, "
-                "strength_as_of: $recorded_at, sunk: false, buried: false, "
+                "strength_as_of: $recorded_at, sunk: $sunk, buried: false, "
                 "buried_ever: false, ruminate_count: 0, "
                 "sensory_cues: $cues})",
                 {
@@ -576,6 +658,10 @@ def build(data: dict, base_path: str) -> dict:
                     "weight": weight,
                     "surprise": surprise,
                     "strength": s0,
+                    # The sunk flag agrees with the band from birth
+                    # (S3): a memory encoded below the threshold is
+                    # born sunk, not born "active at 0.10".
+                    "sunk": s0 < SUNK_THRESHOLD,
                     "salience": event_salience(mood),
                     "cues": mem.get("sensory_cues", []),
                 })
@@ -584,21 +670,6 @@ def build(data: dict, base_path: str) -> dict:
                     "MATCH (m:Memory {id: $id}), (c:Cue {label: $label}) "
                     "CREATE (m)-[:TRIGGERED_BY]->(c)",
                     {"id": mem["id"], "label": label})
-            # Provenance: the DERIVED_FROM edge points at the immediate
-            # source — the witnessed event, or an earlier memory in the
-            # same chapter. A derivation that crossed chapters was
-            # routed to the index instead (route_derivations).
-            if mem["id"] in intra_by_child:
-                db.execute(
-                    "MATCH (m:Memory {id: $id}), "
-                    "(parent:Memory {id: $parent}) "
-                    "CREATE (m)-[:DERIVED_FROM]->(parent)",
-                    {"id": mem["id"], "parent": intra_by_child[mem["id"]]})
-            elif not mem.get("derived_from_memory"):
-                db.execute(
-                    "MATCH (m:Memory {id: $id}), (e:Event {id: $event}) "
-                    "CREATE (m)-[:DERIVED_FROM]->(e)",
-                    {"id": mem["id"], "event": mem["source_event"]})
             for person in mem.get("about", []):
                 db.execute(
                     "MATCH (m:Memory {id: $id}), (p:Person {name: $person}) "
@@ -613,6 +684,48 @@ def build(data: dict, base_path: str) -> dict:
                 "MATCH (m:Memory {id: $id}), (p:Period {id: $pid}) "
                 "CREATE (m)-[:PART_OF]->(p)",
                 {"id": mem["id"], "pid": pid})
+
+        # Provenance, wired in a SECOND pass (B3): every Memory node
+        # of this chapter now exists, so a child listed *before* its
+        # parent in the dataset still finds the parent to point at.
+        # (Wiring each edge in the creation pass silently matched
+        # zero rows for an early child, and the missing edge was
+        # never retried — an orphan memory with a clean conscience.)
+        # The DERIVED_FROM edge points at the immediate source — the
+        # witnessed event, or the parent memory in the same chapter.
+        # A derivation that crossed chapters was routed to the index
+        # instead (route_derivations); those children are verified
+        # against the index registration below, not here.
+        cross_children = {child for child, _parent in cross_deriv}
+        for mem in mems:
+            if mem["id"] in intra_by_child:
+                db.execute(
+                    "MATCH (m:Memory {id: $id}), "
+                    "(parent:Memory {id: $parent}) "
+                    "CREATE (m)-[:DERIVED_FROM]->(parent)",
+                    {"id": mem["id"], "parent": intra_by_child[mem["id"]]})
+            elif not mem.get("derived_from_memory"):
+                db.execute(
+                    "MATCH (m:Memory {id: $id}), (e:Event {id: $event}) "
+                    "CREATE (m)-[:DERIVED_FROM]->(e)",
+                    {"id": mem["id"], "event": mem["source_event"]})
+        # Verification: no silent orphans. Every memory filed here
+        # must carry exactly one in-partition DERIVED_FROM edge, or
+        # be a registered cross-period child. Anything else is a
+        # build failure, reported as one — never a graph that merely
+        # *claims* every memory is backed.
+        for mem in mems:
+            if mem["id"] in cross_children:
+                continue
+            n = db.execute(
+                "MATCH (m:Memory {id: $id})-[:DERIVED_FROM]->() "
+                "RETURN count(*) AS c",
+                {"id": mem["id"]},
+            ).data()[0]["c"]
+            if n != 1:
+                raise RuntimeError(
+                    f"build failed: memory {mem['id']} in period {pid} "
+                    f"has {n} DERIVED_FROM edges (expected exactly 1)")
 
         # Routine nodes for this chapter: materialised summaries of
         # the repeated days. They summarise; they replace nothing —

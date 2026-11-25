@@ -19,9 +19,11 @@ We use Relate in **directory mode** rather than `:memory:` or a single `.rl` fil
 ## Quick start
 
 ```bash
-pip install -r requirements.txt   # just relate-db
+pip install -r requirements.txt   # just relate-db (pinned: 1.2.0)
 python build_graph.py             # builds the persistent graph into ./store
 python demo.py                    # runs all seven showcases
+python demo.py --passphrase mira-unlock-demo
+                                  # opt-in: also run showcase 2's unlock path
 python -m unittest discover -s tests -v   # smoke tests
 ```
 
@@ -107,9 +109,9 @@ The dataset holds 6 people, 8 places, 10 items, 28 events, 3 periods, 26 cues an
 1. **Provenance audit.** The agent claims *"Theo takes his mint tea with honey, never with sugar."* The demo walks its `DERIVED_FROM` chain — memory → earlier memory → the witnessed café event, complete with date, place and who was present — then audits the whole graph: 61/61 memories trace back to a source event. If there is no path, there is no memory.
 
 2. **Privacy tiers.** *"What is Theo keeping in his desk drawer?"*
-   - A **naive** recall (no filter) leaks the `SECRET_LOCKED` memory — this is what an unguarded memory layer does.
+   - A **naive** recall (no filter) leaks the `SECRET_LOCKED` memory — printed under an explicit *teaching contrast* label; it is not a path the agent ever answers through, only a demonstration of what an unguarded memory layer does.
    - The **default** recall hard-filters `SECRET_LOCKED`; the agent can acknowledge the evening ("he stayed up late writing") without revealing its content.
-   - The **unlock path** (demo passphrase `mira-unlock-demo`, `--wrong-passphrase` shows rejection) is the only route to locked content.
+   - The **unlock path** is the only route to locked content — and the demo only attempts it when you pass `--passphrase mira-unlock-demo` explicitly (`--wrong-passphrase` shows rejection). A plain `python demo.py` run never unlocks anything.
 
 3. **Graph recall vs. keyword search.** Six questions that need multi-hop reasoning — latest-by-date ordering, gift chains, place aggregation, plan→item joins — are answered by Cypher traversals and by a naive keyword-overlap baseline over the same memory texts. The graph answers 6/6; the baseline only finds what a single memory's text happens to spell out.
 
@@ -176,7 +178,7 @@ Emotion is the master switch. Each memory inherits an explicit `emotion` from it
 | **buried** | vulnerable, shame, fear | 1.8 | encoded the strongest of all — then **actively pushed down** (below) |
 | **standard** | calm, quiet | 0.7–0.8 | small things sink in weeks |
 
-**Burial (protective forgetting / motivated suppression).** A buried-pathway memory encoded at strength ≥ 0.6 does not fade through the haze. At the first advance of time it is marked `buried`: its strength freezes, and *no* recall path reaches it — not default recall, not `include_sunk`, nothing. It bypassed the haze on the way down. But **buried ≠ deleted**: the node, its frozen strength and its full provenance chain remain, and the audit walk finds it instantly. Only two keys fit a buried memory: a **life cue** (a new event sharing a person, place or item with its source event) or a **sensory cue** (below). `SECRET_LOCKED` still outranks everything: a buried secret that resurfaces stays invisible without the unlock path.
+**Burial (protective forgetting / motivated suppression).** A buried-pathway memory encoded at strength ≥ 0.6 does not fade through the haze. When time first advances past it, it is marked `buried` *before* any decay is applied, so its strength freezes at exactly its encoded strength, however large the step of time was; *no* recall path reaches it — not default recall, not `include_sunk`, nothing — and it cannot be reinforced by ID either. It bypassed the haze on the way down. But **buried ≠ deleted**: the node, its frozen strength and its full provenance chain remain, and the audit walk finds it instantly. Only two keys fit a buried memory: a **life cue** (a new event sharing a person, place or item with its source event) or a **sensory cue** (below). `SECRET_LOCKED` outranks even resurfacing: the cue paths filter locked memories out entirely — a buried secret is not raised, not moved, not even *named* by its rescue; only the passphrase-gated unlock path reaches its text.
 
 The state machine, in text:
 
@@ -226,22 +228,24 @@ At encoding time, memories bind **sensory anchors** — `sensory_cues` on the no
 
 A fired cue — a person returning, a taste, a smell — resurfaces sunk and even buried memories. But the way back is **not** the way down reversed. A resurfaced memory climbs a ladder, one rung per subsequent mention:
 
-1. **AFFECT** — only the feeling returns: recall yields the emotion and valence tags and a marker ("something about this stirs a feeling"), *no content whatsoever*;
+1. **AFFECT** — only the feeling returns: recall yields the emotion and valence tags and *no content whatsoever* (`content` is `None` — there is no text at this rung, not even a stored one);
 2. **FRAGMENT** — one isolated shard surfaces (the stored `shard`: a place, an object, half a moment), unrelated to any outline — *a shard, not the story*;
 3. **HAZY** — the gist assembles; the memory re-enters the normal banded life;
 4. **CLEAR** — one more mention, and the whole story is back.
 
 ### Routine merging: nobody remembers six identical afternoons
 
-Conway's middle layer — *general events* — is where repeated days live, and until v1.6 this graph skipped it: every afternoon answered for itself. Now, at build time, a deterministic grouping pass (`build_graph.routine_groups`) looks for days that have collapsed into a habit. A memory joins a candidate bucket when it is an **episode** (facts, preferences, plans and secrets are not days and keep their own recall paths), is not `SECRET_LOCKED`, and its source event is **unsurprising** (`surprise ≤ 0.2` — a surprising day is an event, not a routine). Buckets are keyed by *(chapter, place, pathway)*; a bucket becomes a routine at **≥ 4 members** whose emotion weights agree within 0.15. One pathway is excluded outright: `buried` — a suppressed memory must never be summarised, because a summary naming its days would leak exactly what suppression holds down.
+Conway's middle layer — *general events* — is where repeated days live, and until v1.6 this graph skipped it: every afternoon answered for itself. Now, at build time, a deterministic grouping pass (`build_graph.routine_groups`) looks for days that have collapsed into a habit. A memory joins a candidate bucket when it is an **episode** (facts, preferences, plans and secrets are not days and keep their own recall paths), is not `SECRET_LOCKED`, and its source event is **unsurprising** (`surprise ≤ 0.2` — a surprising day is an event, not a routine). Buckets are keyed by *(chapter, place, pathway)*; a bucket becomes a routine when its largest weight-agreeing subset (weights within 0.15) reaches **≥ 4 members**. One pathway is excluded outright: `buried` — a suppressed memory must never be summarised, because a summary naming its days would leak exactly what suppression holds down.
 
 A qualifying bucket materialises as a **Routine node** in its chapter's store, with `SUMMARIZES` edges to every member and the members' `routine_id` set. Its summary is a pre-stored rendering composed from the data — *"During The Restless Spring, visits to Harbor Bookstore settled into a routine: 6 similar days between 2026-03-07 and 2026-04-25, each one unremarkable on its own, together a habit."* Nothing is deleted: every member keeps its text, its strength, and its full provenance chain.
+
+Two refinements from the v1.7 hardening round: the routine's id names its pathway as well as its chapter and place (`routine-p2-standard-harbor-bookstore`), so two different emotional flavours of the same place can never overwrite each other; and grouping no longer demands that a whole bucket agree — within a bucket, the group is the *largest subset* of members whose weights agree within 0.15, so one tender afternoon among joyful ones no longer kills the habit (it simply stays an individual memory). The summary counts *distinct days*, not members: two memories of one afternoon are one day of the habit. Privacy is also re-checked at recall time, not just at build time: if a member has since been locked, its group stops collapsing and the drill-down withholds the day.
 
 Recall changes shape, not content. When two or more members of a routine survive the usual band and privacy filters, `decay.recall` replaces them with a single `routine` entry carrying the stored summary (a lone surviving member still answers individually — the last afternoon standing stands on its own). And the habit is not a wall: `decay.routine_drilldown` walks the `SUMMARIZES` edges and returns every member in date order, with its full text and current band. Merged for remembering, never for auditing. Demo 7, Act 1 shows the before/after on the same question.
 
 ### Cue dilution: the key is blunted by reuse
 
-Earlier versions of this README said cue edges do not decay — true, and incomplete. A cue itself never fades, but the energy it can deliver to *one* memory is divided among everything it has been bound to since: **`energy = 1 / degree`**, where degree counts the cue's `TRIGGERED_BY` bindings across the whole library (memories and periods alike, read live from the graph — `decay.cue_energy`). Hear a song once in three years and it is a lightning strike; set it as your morning alarm and it is just a sound.
+Earlier versions of this README said cue edges do not decay — true, and incomplete. A cue itself never fades, but the energy it can deliver to *one* memory is divided among what it has been bound to since: **`energy = 1 / degree`**. Hear a song once in three years and it is a lightning strike; set it as your morning alarm and it is just a sound. Two divisors, for two different jobs: **sensory resurfacing** divides by the number of distinct *memories* bound to the cue (`decay.cue_memory_degree`) — a cue that also names a whole period is not blunted by that landing, because the period is not a rival memory; **spreading activation** scales its injection by the cue's full node energy (`decay.cue_energy`), landings of every kind included, because there the cue's charge really is spent across everything it touches.
 
 Dilution lands in two places. In **sensory resurfacing**, a fired cue raises each sunk memory at entry strength `0.40 × energy` instead of a flat 0.40: a cue shared four ways sets its memories down at 0.10, below the sinking line — the feeling and the shard still climb their ladder, but when the ladder clears there is not enough strength left for the story to assemble, and the memory slips back under. A **buried** memory is stricter: suppression only breaks at `energy ≥ 0.5`; below that the cue reaches it but cannot raise it — the firing reports it as *stirred* (`raised = False`) and the graph is left untouched, still buried, still frozen. In **spreading activation**, the injected activation is likewise scaled by the cue's energy. Life-cue resurfacing (a person returning) is *not* diluted: June is not a smell, and her return does not divide. Demo 7, Act 2 runs the controlled comparison — the same cue, the same memory, degree 1 versus degree 4.
 
@@ -277,7 +281,11 @@ data/memories.json    the synthetic dataset (people, places, items, events,
 tests/test_smoke.py   build + provenance + privacy + multi-hop + decay +
                       haze + detail weights + emotion + burial + period +
                       surprise + storage-partition invariants + routine
-                      merging + cue dilution + rumination (43 tests)
+                      merging + cue dilution + rumination + the v1.7
+                      fix-round regressions: privacy on every path out
+                      of the graph, verbatim-only recall, build-order
+                      robustness, flag/band consistency, deterministic
+                      tie-breaks (74 tests)
 store/                the persistent library: store/index/ plus
                       store/periods/<chapter-slug>/ (inspect any of them
                       with the relate CLI)
@@ -293,4 +301,5 @@ store_rumination/     demo 7 act 3's own library, rebuilt fresh on every run
 
 - Rebuilding is reproducible: `python build_graph.py --fresh` recreates the store from the dataset.
 - The unlock passphrase is a demo stand-in for the owner's credential, which a host application would check outside the database.
+- **v1.7 hardening round:** an external static code review raised 14 findings (4 blocking). Every finding was reproduced against the running code before being fixed — and each fix is pinned by a regression test (74 in total). The full audit trail is the v1.7 chapter of `BUILD-REPORT.md`.
 - License: MIT (hackathon project).

@@ -29,20 +29,27 @@ Run:  python -m unittest discover -s tests -v
 
 from __future__ import annotations
 
+import copy
+import io
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import decay  # noqa: E402
+import demo  # noqa: E402
 from build_graph import (  # noqa: E402
     build,
     detail_inventories,
     load_dataset,
     route_derivations,
+    routine_groups,
 )
 from library import Library  # noqa: E402
 
@@ -457,17 +464,22 @@ class BuriedTest(_TempLibrary):
         resurfaced = decay.cue_resurface(lib, "2026-08-18",
                                          person="June")
         self.assertIn("m43", [r["id"] for r in resurfaced])
-        # First rung: AFFECT — emotion only, no content of any kind.
+        # First rung: AFFECT — emotion only, no content of any kind:
+        # recall returns None for content at this rung (B4), not a
+        # sentence composed on the spot.
         row = self._one(lib, "honest", "m43")
         self.assertEqual(row["form"], "affect")
         self.assertEqual(row["emotion"], "vulnerable")
-        self.assertNotIn("conversation", row["content"])
-        self.assertNotIn("overwhelmed", row["content"])
-        # Second rung: FRAGMENT — a single shard, not the story.
+        self.assertIsNone(row["content"])
+        # Second rung: FRAGMENT — a single shard, not the story: the
+        # shard exactly as stored in the graph (B4).
         decay.reinforce(lib, "m43", "2026-08-20")
         row = self._one(lib, "honest", "m43")
         self.assertEqual(row["form"], "fragment")
-        self.assertIn("a friend's voice", row["content"])
+        stored_shard = lib.db_for_memory("m43").execute(
+            "MATCH (m:Memory {id: 'm43'}) RETURN m.shard AS shard"
+        ).data()[0]["shard"]
+        self.assertEqual(row["content"], stored_shard)
         self.assertNotIn("overwhelmed", row["content"])
         # Third rung: the stage clears and the gist assembles (HAZY).
         decay.reinforce(lib, "m43", "2026-08-22")
@@ -499,8 +511,7 @@ class BuriedTest(_TempLibrary):
         row = self._one(lib, "toast", "m52")
         self.assertEqual(row["form"], "affect")
         self.assertEqual(row["emotion"], "shame")
-        self.assertNotIn("stumbled", row["content"])
-        self.assertNotIn("toast", row["content"])
+        self.assertIsNone(row["content"])
 
 
 class PeriodTest(_TempLibrary):
@@ -827,7 +838,7 @@ class StoragePartitionTest(_TempLibrary):
 class RoutineTest(_TempLibrary):
     """Routine merging: repeated days collapse into the habit (v1.6)."""
 
-    RID = "routine-p2-harbor-bookstore"
+    RID = "routine-p2-standard-harbor-bookstore"
     MEMBERS = {"m20", "m57", "m58", "m59", "m60", "m61"}
 
     def test_grouping_is_deterministic_and_structural(self) -> None:
@@ -1099,6 +1110,522 @@ class RuminationTest(_TempLibrary):
         self.assertLess(posts[4], posts[3])
         self.assertLess(posts[-1], posts[4])
         self.assertTrue(all(p <= decay.RUMINATION_CAP + 1e-9 for p in posts))
+
+
+class FixRegressionTest(_TempLibrary):
+    """Regression nails for the v1.7 fix round (Codex review B1–B4,
+    S1–S9, N1). Each test pins one verified finding shut."""
+
+    RID = "routine-p2-standard-harbor-bookstore"
+
+    # ---------- helpers ----------
+
+    def _capture(self, fn, *args) -> str:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            fn(*args)
+        return buf.getvalue()
+
+    def _mem(self, lib, mid: str) -> dict:
+        return lib.db_for_memory(mid).execute(
+            "MATCH (m:Memory {id: $id}) RETURN m.buried AS buried, "
+            "m.strength AS strength, m.encoded_strength AS encoded, "
+            "m.sunk AS sunk, m.resurface_stage AS stage, "
+            "m.privacy AS privacy",
+            {"id": mid},
+        ).data()[0]
+
+    def _mini_data(self) -> dict:
+        return {
+            "people": [{"name": "Theo", "role": "owner", "note": ""},
+                       {"name": "June", "role": "friend", "note": ""},
+                       {"name": "Ana", "role": "sister", "note": ""}],
+            "places": [{"name": "Home", "kind": "apartment"},
+                       {"name": "Bookshop", "kind": "shop"}],
+            "items": [],
+            "periods": [
+                {"id": "pa", "name": "Chapter A", "start_date": "2026-01-01",
+                 "end_date": "2026-03-31", "atmosphere": "quiet",
+                 "dominant_emotion": "calm", "sensory_cues": []},
+                {"id": "pb", "name": "Chapter B", "start_date": "2026-04-01",
+                 "end_date": "2026-06-30", "atmosphere": "bright",
+                 "dominant_emotion": "calm", "sensory_cues": []},
+            ],
+            "events": [],
+            "memories": [],
+        }
+
+    @staticmethod
+    def _event(eid, date, mood, place="Home", surprise=0.0, with_=None):
+        return {"id": eid, "title": f"Event {eid}", "date": date,
+                "mood": mood, "surprise": surprise, "place": place,
+                "with": with_ or [], "items": [], "tags": []}
+
+    @staticmethod
+    def _memory(mid, event, recorded, text=None, privacy="PUBLIC",
+                kind="episode", cues=None, about=None, derived=None):
+        mem = {"id": mid, "text": text or f"Memory {mid} text.",
+               "vague": f"Memory {mid}, vaguely.", "anon": "A memory.",
+               "gist": f"Memory {mid}, in gist.", "kind": kind,
+               "privacy": privacy, "confidence": 0.9,
+               "recorded_at": recorded, "source_event": event,
+               "about": about or ["Theo"], "involves": [],
+               "sensory_cues": cues or []}
+        if derived:
+            mem["derived_from_memory"] = derived
+        return mem
+
+    def _open_data(self, data: dict) -> Library:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = str(Path(tmp.name) / "lib")
+        self.counts = build(data, base)
+        lib = Library(base)
+        self.addCleanup(lib.close)
+        return lib
+
+    # ---------- B1: no silent unlock ----------
+
+    def test_b1_demo_passphrase_defaults_to_none(self) -> None:
+        args = demo._parser().parse_args([])
+        self.assertIsNone(args.passphrase)
+        self.assertFalse(args.wrong_passphrase)
+
+    def test_b1_locked_text_only_via_explicit_passphrase(self) -> None:
+        lib = self.open_library()
+        secret = next(m["text"] for m in self.load_data()["memories"]
+                      if m["id"] == "m30")
+        # Default run: the teaching contrast (a) shows the secret —
+        # labelled as such — but the unlock section (c) never does.
+        out = self._capture(demo.demo_privacy, lib, None)
+        head, _, tail = out.partition("(c) EXPLICIT UNLOCK path")
+        self.assertIn("TEACHING CONTRAST", head)
+        self.assertIn(secret, head)          # the deliberate contrast
+        self.assertNotIn(secret, tail)
+        self.assertIn("unlock not attempted", tail)
+        # Wrong passphrase: denied, nothing returned.
+        out = self._capture(demo.demo_privacy, lib, "wrong-guess")
+        tail = out.partition("(c) EXPLICIT UNLOCK path")[2]
+        self.assertNotIn(secret, tail)
+        self.assertIn("access denied", tail)
+        # Explicit correct passphrase: the one legitimate path.
+        out = self._capture(demo.demo_privacy, lib, demo.DEMO_PASSPHRASE)
+        tail = out.partition("(c) EXPLICIT UNLOCK path")[2]
+        self.assertIn(secret, tail)
+
+    def test_b1_demo_source_has_no_unlocked_call(self) -> None:
+        src = (ROOT / "demo.py").read_text(encoding="utf-8")
+        self.assertNotIn("unlocked=True", src)
+
+    # ---------- B2: privacy on every path out of the graph ----------
+
+    def test_b2_cue_resurface_never_names_or_moves_locked(self) -> None:
+        lib = self.open_library()
+        decay.advance_time(lib, "2026-05-25")
+        before = self._mem(lib, "m32")
+        self.assertTrue(before["buried"])
+        res = decay.cue_resurface(lib, "2026-08-18", person="June")
+        self.assertNotIn("m32", [r["id"] for r in res])
+        after = self._mem(lib, "m32")
+        self.assertTrue(after["buried"])                 # unmoved
+        self.assertIsNone(after["stage"])                # not staged
+        self.assertEqual(after["strength"], before["strength"])
+
+    def test_b2_sense_resurface_skips_locked_buried(self) -> None:
+        data = self._mini_data()
+        data["events"].append(self._event("eb", "2026-01-10", "shame"))
+        data["memories"].append(self._memory(
+            "mb", "eb", "2026-01-11", privacy="SECRET_LOCKED",
+            cues=["smell:bonfire"], about=["Theo", "Ana"]))
+        lib = self._open_data(data)
+        decay.advance_time(lib, "2026-03-31")
+        self.assertTrue(self._mem(lib, "mb")["buried"])
+        self.assertEqual(
+            decay.sense_resurface(lib, "smell:bonfire", "2026-04-01"), [])
+        self.assertTrue(self._mem(lib, "mb")["buried"])
+
+    def test_b2_drilldown_filters_member_locked_after_build(self) -> None:
+        lib = self.open_library()
+        lib.db_for_memory("m57").execute(
+            "MATCH (m:Memory {id: 'm57'}) SET m.privacy = 'SECRET_LOCKED'")
+        days = decay.routine_drilldown(lib, self.RID)
+        self.assertEqual(len(days), 5)
+        self.assertNotIn("m57", [d["id"] for d in days])
+
+    def test_b2_collapse_skips_group_with_locked_member(self) -> None:
+        lib = self.open_library()
+        lib.db_for_memory("m57").execute(
+            "MATCH (m:Memory {id: 'm57'}) SET m.privacy = 'SECRET_LOCKED'")
+        hits = decay.recall(lib, "bookstore")
+        self.assertNotIn(self.RID, [h["id"] for h in hits])
+        self.assertNotIn("m57", [h["id"] for h in hits])
+
+    # ---------- B3: provenance robust to dataset order ----------
+
+    def test_b3_child_listed_before_parent_still_traces(self) -> None:
+        data = copy.deepcopy(self.load_data())
+        mems = data["memories"]
+        child = next(m for m in mems if m["id"] == "m48")
+        mems.remove(child)
+        mems.insert(0, child)      # child now precedes its parent m01
+        lib = self._open_data(data)
+        parent = lib.db_for_memory("m48").execute(
+            "MATCH (m:Memory {id: 'm48'})-[:DERIVED_FROM]->(p) "
+            "RETURN p.id AS id").data()
+        self.assertEqual([r["id"] for r in parent], ["m01"])
+        reachable = lib.execute_all(
+            "MATCH (m:Memory)-[:DERIVED_FROM*]->(e:Event) "
+            "RETURN DISTINCT m.id AS id")
+        self.assertEqual(len(reachable), 61)
+
+    def test_b3_demo_audit_uses_unbounded_path(self) -> None:
+        src = (ROOT / "demo.py").read_text(encoding="utf-8")
+        self.assertNotIn("DERIVED_FROM*1..5", src)
+        self.assertIn("DERIVED_FROM*", src)
+
+    # ---------- B4: recall only ever selects stored renderings ----------
+
+    def _stored_renderings(self, lib, row_id: str) -> set:
+        if row_id.startswith("routine-"):
+            rows = lib.execute_all(
+                "MATCH (r:Routine {id: $id}) RETURN r.text AS text, "
+                "r.gist AS gist", {"id": row_id})
+            return {rows[0]["text"], rows[0]["gist"]}
+        rows = lib.db_for_memory(row_id).execute(
+            "MATCH (m:Memory {id: $id}) RETURN m.text AS text, "
+            "m.vague AS vague, m.anon AS anon, m.gist AS gist, "
+            "m.shard AS shard, m.haze1 AS haze1, m.haze2 AS haze2, "
+            "m.haze3 AS haze3", {"id": row_id}).data()
+        return set(rows[0].values())
+
+    def test_b4_every_recall_content_is_a_stored_rendering(self) -> None:
+        lib = self.open_library()
+        decay.advance_time(lib, "2026-05-25")
+        decay.cue_resurface(lib, "2026-08-18", person="June")
+        checked = 0
+        for kw in ("scarf", "letter", "bookstore", "honest", "toast",
+                   "chess", "market", "sister"):
+            for row in decay.recall(lib, kw, include_sunk=True):
+                checked += 1
+                if row["content"] is None:
+                    # Only the AFFECT rung may carry no content.
+                    self.assertEqual(row["form"], "affect")
+                else:
+                    self.assertIn(row["content"],
+                                  self._stored_renderings(lib, row["id"]))
+        self.assertGreater(checked, 20)
+
+    def test_b4_staged_rows_quote_the_graph_verbatim(self) -> None:
+        lib = self.open_library()
+        decay.advance_time(lib, "2026-05-25")
+        decay.cue_resurface(lib, "2026-08-18", person="June")
+        row = self._one(lib, "honest", "m43")
+        self.assertEqual(row["form"], "affect")
+        self.assertIsNone(row["content"])
+        decay.reinforce(lib, "m43", "2026-08-20")
+        row = self._one(lib, "honest", "m43")
+        self.assertEqual(row["form"], "fragment")
+        shard = lib.db_for_memory("m43").execute(
+            "MATCH (m:Memory {id: 'm43'}) RETURN m.shard AS shard"
+        ).data()[0]["shard"]
+        self.assertEqual(row["content"], shard)
+
+    # ---------- S1: the printed model matches the code ----------
+
+    def test_s1_demo4_header_states_the_surprise_factor(self) -> None:
+        src = (ROOT / "demo.py").read_text(encoding="utf-8")
+        self.assertIn("(1 + 0.6 x the event's surprise)", src)
+
+    # ---------- S2: burial discipline ----------
+
+    def test_s2_reinforce_cannot_raise_the_buried_by_id(self) -> None:
+        lib = self.open_library()
+        decay.advance_time(lib, "2026-05-25")
+        self.assertTrue(self._mem(lib, "m43")["buried"])
+        with self.assertRaises(ValueError):
+            decay.reinforce(lib, "m43", "2026-05-26")
+
+    def test_s2_future_memory_is_not_buried_before_its_day(self) -> None:
+        lib = self.open_library()
+        decay.advance_time(lib, "2026-01-15")   # m52 recorded 2026-02-09
+        self.assertFalse(self._mem(lib, "m52")["buried"])
+
+    def test_s2_frozen_strength_is_the_encoded_strength(self) -> None:
+        lib1 = self.open_library()
+        decay.advance_time(lib1, "2026-05-25")               # one jump
+        lib2 = self.open_library()
+        for day in ("2026-03-01", "2026-04-01", "2026-05-25"):
+            decay.advance_time(lib2, day)                    # small steps
+        for lib in (lib1, lib2):
+            row = self._mem(lib, "m43")
+            self.assertTrue(row["buried"])
+            self.assertAlmostEqual(row["strength"], row["encoded"],
+                                   places=9)
+
+    def test_s2_period_emergence_excludes_buried_shards(self) -> None:
+        lib = self.open_library()
+        decay.advance_time(lib, "2026-05-25")
+        # p2's own period cue ('sound:rain on the awning') opens the
+        # Restless Spring; its buried memories' shards stay down.
+        pe = decay.period_emergence(lib, "sound:rain on the awning")
+        self.assertIsNotNone(pe)
+        self.assertEqual(pe["period"], "The Restless Spring")
+        frag_ids = {f["id"] for f in pe["fragments"]}
+        self.assertTrue(frag_ids)   # the era still speaks in shards
+        self.assertFalse(frag_ids & {"m32", "m33", "m43"})
+
+    # ---------- S3: flags, bands and steps agree ----------
+
+    def test_s3_diluted_resurface_keeps_the_sunk_flag_honest(self) -> None:
+        data = self._mini_data()
+        data["events"].append(self._event("es", "2026-01-12", "calm"))
+        data["memories"].append(self._memory(
+            "ms", "es", "2026-01-13", text="Theo watched the rain.",
+            cues=["smell:rain"]))
+        for i in range(3):
+            data["events"].append(
+                self._event(f"ex{i}", f"2026-01-{15 + i}", "calm"))
+            data["memories"].append(self._memory(
+                f"mx{i}", f"ex{i}", f"2026-01-{16 + i}",
+                text=f"Rain again, day {i}.", cues=["smell:rain"]))
+        lib = self._open_data(data)
+        decay.advance_time(lib, "2026-03-31")
+        res = decay.sense_resurface(lib, "smell:rain", "2026-04-01")
+        hit = next(r for r in res if r["id"] == "ms")
+        self.assertAlmostEqual(hit["strength"], 0.10)
+        row = self._mem(lib, "ms")
+        self.assertTrue(row["sunk"])                    # flag agrees
+        # The unified recall may show the staged rung — a feeling
+        # with no content — but never the memory's text.
+        for hit in decay.recall(lib, "rain"):
+            if hit["id"] == "ms":
+                self.assertEqual(hit["form"], "affect")
+                self.assertIsNone(hit["content"])
+        self.assertNotIn(
+            "ms", [h["id"] for h in decay.default_recall(lib, "rain")])
+        self.assertGreaterEqual(decay.counts(lib)["sunk"], 1)
+
+    def test_s3_default_recall_shapes_hazy_text_from_storage(self) -> None:
+        lib = self.open_library()
+        decay.advance_time(lib, "2026-05-25")
+        hits = decay.default_recall(lib, "Theo")
+        hazy = [h for h in hits
+                if decay.band_of(h["strength"]) == decay.BAND_HAZY]
+        self.assertTrue(hazy)   # the era has hazy memories to shape
+        row = hazy[0]
+        stored = lib.db_for_memory(row["id"]).execute(
+            "MATCH (m:Memory {id: $id}) RETURN m.text AS text, "
+            "m.haze1 AS haze1, m.haze2 AS haze2, m.haze3 AS haze3",
+            {"id": row["id"]},
+        ).data()[0]
+        level = decay.haze_level(row["strength"])
+        # The hit carries the stored haze rendering for its level —
+        # never the full text the keyword matched against.
+        self.assertEqual(row["text"], stored[f"haze{level}"])
+        self.assertNotEqual(row["text"], stored["text"])
+
+    def test_s3_recall_period_excludes_sunk(self) -> None:
+        lib = self.open_library()
+        decay.advance_time(lib, "2026-05-25")
+        sunk = {r["id"] for r in lib.partition("p1").execute(
+            "MATCH (m:Memory) WHERE m.sunk = true RETURN m.id AS id"
+        ).data()}
+        self.assertTrue(sunk)
+        rp = decay.recall_period(lib, "The Quiet Winter")
+        self.assertFalse({m["id"] for m in rp["memories"]} & sunk)
+
+    def test_s3_spreading_steps_carry_only_their_level(self) -> None:
+        lib = self.open_library()
+        res = decay.spreading_activation(lib, "taste:morning coffee")
+        seen = set()
+        for step in res["steps"]:
+            if step["kind"] != "memory":
+                continue
+            seen.add(step["level"])
+            if step["level"] == "affect":
+                self.assertIsNone(step["shard"])
+                self.assertIsNone(step["gist"])
+            elif step["level"] == "fragment":
+                self.assertIsNotNone(step["shard"])
+                self.assertIsNone(step["gist"])
+            elif step["level"] == "gist":
+                self.assertIsNotNone(step["gist"])
+        self.assertTrue({"affect", "fragment"} <= seen)
+
+    # ---------- S4: routine grouping ----------
+
+    def _routine_dataset(self, specs) -> dict:
+        """specs: list of (mood, date) — one episode each, all at the
+        Bookshop in chapter pa."""
+        data = self._mini_data()
+        for i, (mood, date) in enumerate(specs):
+            data["events"].append(
+                self._event(f"e{i}", date, mood, place="Bookshop"))
+            data["memories"].append(self._memory(
+                f"m{i}", f"e{i}", date, text=f"Bookshop visit {i}."))
+        return data
+
+    @staticmethod
+    def _period_maps(data: dict):
+        event_period = {e["id"]: "pa" for e in data["events"]}
+        memory_period = {m["id"]: "pa" for m in data["memories"]}
+        return event_period, memory_period
+
+    def test_s4_two_pathways_one_place_two_routines(self) -> None:
+        specs = ([("joyful", f"2026-01-{d:02d}") for d in (3, 10, 17, 24)]
+                 + [("grief", f"2026-02-{d:02d}") for d in (1, 8, 15, 22)])
+        data = self._routine_dataset(specs)
+        groups = routine_groups(data, *self._period_maps(data))
+        self.assertEqual(len(groups), 2)
+        self.assertTrue(any("fast_lane" in rid for rid in groups))
+        self.assertTrue(any("slow_fog" in rid for rid in groups))
+        lib = self._open_data(data)
+        self.assertEqual(self.counts["Routine"], 2)
+
+    def test_s4_mixed_weights_yield_the_agreeing_subset(self) -> None:
+        # fast_lane bucket: joyful x4 at 1.2, one tender at 1.5 —
+        # spread 0.3 > 0.15 must not kill the agreeing four.
+        specs = ([("joyful", f"2026-01-{d:02d}") for d in (3, 10, 17, 24)]
+                 + [("tender", "2026-02-01")])
+        data = self._routine_dataset(specs)
+        groups = routine_groups(data, *self._period_maps(data))
+        self.assertEqual(len(groups), 1)
+        group = next(iter(groups.values()))
+        self.assertEqual(set(group["members"]), {"m0", "m1", "m2", "m3"})
+
+    def test_s4_summary_counts_distinct_days(self) -> None:
+        specs = [("calm", "2026-01-03"), ("calm", "2026-01-03"),
+                 ("calm", "2026-01-10"), ("calm", "2026-01-17")]
+        data = self._routine_dataset(specs)
+        groups = routine_groups(data, *self._period_maps(data))
+        group = next(iter(groups.values()))
+        self.assertEqual(len(group["members"]), 4)
+        self.assertIn("3 similar days", group["text"])
+
+    def test_s4_demo_never_hardcodes_the_routine_id(self) -> None:
+        # The S4 id change stranded demo.py's hardcoded ROUTINE_ID —
+        # masked in the project tree by a stale store, caught by the
+        # clean-room run. The demo now reads the id from the recall
+        # answer itself; pin that it never hardcodes one again.
+        src = (ROOT / "demo.py").read_text(encoding="utf-8")
+        self.assertNotIn("routine-p2-", src)
+
+    # ---------- S5: dilution counts memories, not landings ----------
+
+    def test_s5_period_landing_does_not_dilute_the_cue(self) -> None:
+        data = self._mini_data()
+        data["periods"][0]["sensory_cues"] = ["smell:ash"]
+        for i in (1, 2):
+            data["events"].append(
+                self._event(f"eb{i}", f"2026-01-1{i}", "shame"))
+            data["memories"].append(self._memory(
+                f"mb{i}", f"eb{i}", f"2026-01-1{i + 1}",
+                cues=["smell:ash"], about=["Theo", "Ana"]))
+        lib = self._open_data(data)
+        self.assertEqual(decay.cue_degree(lib, "smell:ash"), 3)
+        self.assertEqual(decay.cue_memory_degree(lib, "smell:ash"), 2)
+        decay.advance_time(lib, "2026-03-31")
+        res = decay.sense_resurface(lib, "smell:ash", "2026-04-01")
+        self.assertEqual({r["id"] for r in res}, {"mb1", "mb2"})
+        self.assertTrue(all(r["raised"] for r in res))
+
+    # ---------- S6: builder validation ----------
+
+    def test_s6_derived_source_event_mismatch_rejected(self) -> None:
+        data = self._mini_data()
+        data["events"].append(self._event("e1", "2026-01-05", "calm"))
+        data["events"].append(self._event("e2", "2026-01-06", "calm"))
+        data["memories"].append(self._memory("m1", "e1", "2026-01-06"))
+        data["memories"].append(self._memory(
+            "m2", "e2", "2026-01-07", derived="m1"))   # chain roots at e1
+        with self.assertRaises(ValueError):
+            self._open_data(data)
+
+    def test_s6_period_slug_collision_keeps_both_chapters(self) -> None:
+        data = self._mini_data()
+        data["periods"][1]["name"] = "Chapter A!"   # slugifies like pa
+        data["events"].append(self._event("e1", "2026-01-05", "calm"))
+        data["events"].append(self._event("e2", "2026-04-05", "calm"))
+        data["memories"].append(self._memory("m1", "e1", "2026-01-06"))
+        data["memories"].append(self._memory("m2", "e2", "2026-04-06"))
+        lib = self._open_data(data)
+        self.assertEqual(self.counts["Memory"], 2)
+        slugs = {r["id"]: r["slug"] for r in lib.index.execute(
+            "MATCH (p:Period) RETURN p.id AS id, p.slug AS slug").data()}
+        self.assertNotEqual(slugs["pa"], slugs["pb"])
+        self.assertEqual(
+            lib.partition("pa").execute(
+                "MATCH (m:Memory) RETURN count(*) AS c").data()[0]["c"], 1)
+        self.assertEqual(
+            lib.partition("pb").execute(
+                "MATCH (m:Memory) RETURN count(*) AS c").data()[0]["c"], 1)
+
+    # ---------- S7: deterministic tie-breaks, across processes ----------
+
+    def _bridge_dataset(self) -> dict:
+        """A cue lands on ms in chapter pa. mx (about June) and mx2
+        (about Ana) share ms's event, so the spread charges them
+        identically. In chapter pb, my is about both June and Ana —
+        two bridges into the same memory, carrying exactly equal
+        echoes."""
+        data = self._mini_data()
+        data["events"].append(self._event("es", "2026-01-05", "calm"))
+        data["events"].append(self._event("ey", "2026-04-10", "calm"))
+        data["memories"].append(self._memory(
+            "ms", "es", "2026-01-06", cues=["smell:tie"]))
+        data["memories"].append(self._memory(
+            "mx", "es", "2026-01-06", about=["June"]))
+        data["memories"].append(self._memory(
+            "mx2", "es", "2026-01-06", about=["Ana"]))
+        data["memories"].append(self._memory(
+            "my", "ey", "2026-04-11", about=["Theo", "June", "Ana"]))
+        return data
+
+    def test_s7_bridge_tie_breaks_by_person_then_source(self) -> None:
+        lib = self._open_data(self._bridge_dataset())
+        res = decay.spreading_activation(lib, "smell:tie")
+        echo = next(e for e in res["echoes"] if e["id"] == "my")
+        # Both bridges carry the same activation x 0.55 x 0.30; the
+        # tie is won by ('Ana', 'mx2') < ('June', 'mx') — never by
+        # arrival order.
+        self.assertEqual(echo["via_person"], "Ana")
+        self.assertEqual(echo["from"], "mx2")
+
+    def test_s7_same_trace_under_different_hash_seeds(self) -> None:
+        script = (
+            "import json, sys, tempfile\n"
+            "from pathlib import Path\n"
+            f"sys.path.insert(0, {str(ROOT)!r})\n"
+            "from build_graph import build\n"
+            "from library import Library\n"
+            "import decay\n"
+            f"data = json.loads({json.dumps(json.dumps(self._bridge_dataset()))})\n"
+            "tmp = tempfile.mkdtemp()\n"
+            "build(data, str(Path(tmp) / 'lib'))\n"
+            "lib = Library(str(Path(tmp) / 'lib'))\n"
+            "res = decay.spreading_activation(lib, 'smell:tie')\n"
+            "print(json.dumps(res, sort_keys=True))\n"
+        )
+        outputs = []
+        for seed in ("0", "42"):
+            env = dict(os.environ, PYTHONHASHSEED=seed)
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                capture_output=True, text=True, env=env, timeout=300)
+            self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+            outputs.append(proc.stdout)
+        self.assertEqual(outputs[0], outputs[1])
+
+    # ---------- S9 + N1 ----------
+
+    def test_s9_requirements_pin_the_verified_relate_db(self) -> None:
+        text = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+        self.assertIn("relate-db==1.2.0", text)
+
+    def test_n1_empty_period_list_searches_nothing(self) -> None:
+        lib = self.open_library()
+        self.assertEqual(decay.recall(lib, "scarf", periods=[]), [])
+        self.assertTrue(decay.recall(lib, "scarf"))   # control
 
 
 if __name__ == "__main__":

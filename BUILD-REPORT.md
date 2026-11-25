@@ -625,3 +625,139 @@ declining despite continued mentions).
   compatible with the v1.4 index (FIRES_IN unchanged) and with the
   "cues persist" claim: what persists is the key; what fades is how
   much of it is left for any one lock.
+
+# v1.7 — The hardening round: an external review, verified finding by finding (2026-11-25)
+
+## What happened
+
+After v1.6 shipped, the codebase was handed to an external reviewer
+(Codex, gpt-6.2-astra) for a static review — source only, no
+execution, dataset JSON not included. It returned a **do-not-ship**
+verdict: 4 BLOCKERs, 9 SHOULD-FIXes, 1 NIT. The full review text is
+preserved in `CODEX-REVIEW.md`.
+
+Standing rule for the round: **no finding was fixed on the reviewer's
+say-so.** Each one was first reproduced against the running code
+(minimal synthetic datasets or the shipped demo/tests). All 14
+reproduced — 13 exactly as described, S7 as a latent mechanism (the
+shipped dataset's traces are in fact identical across hash seeds;
+the nondeterminism needed a crafted tie to show itself). Only then
+was anything changed. What the reviewer confirmed as *correct* was
+also recorded, and none of it was touched: the half-life formula
+45 × emotion_weight × (1 + 1.8·surprise), the grey-zone boundaries
+0.25/0.35/0.45/0.55 with the 3/2/1 detail rule, the rumination gain
+table 0.8, 0.8, 0.8, 0.4, 0.2, …, the cross-chapter echo cap of
+0.165, the buried-lift energy threshold of exactly 0.5, the
+person-return cue being undiluted, the absence of random/now() in
+the code, and the routine grouping conditions themselves.
+
+## Disposition table
+
+| # | Finding (verified behaviour) | Fix | Pinned by |
+|---|---|---|---|
+| B1 | `python demo.py` with no arguments printed the SECRET_LOCKED m30 in full, twice: the `--passphrase` argument *defaulted* to the demo passphrase, and Demo 5 called the unlock path directly | `--passphrase` defaults to `None`; the unlock is opt-in and Demo 2(c) says so when not attempted. Demo 5 no longer unlocks at all — it states that Demo 2's gated path is the only route. No `unlocked=True` call remains in demo.py | parser-default test; section-aware demo_privacy tests (default / wrong / explicit); source scan |
+| B2 | Cue resurfacing ignored privacy: `cue_resurface(person="June")` listed the locked buried m32 in its result *and unburied it*; `routine_drilldown` returned a member locked after build; Demo 3's Q4/Q6 traversals carried no privacy predicate (latent — no locked plan/preference in the data) | Every path that can carry content out of the graph now filters `privacy <> 'SECRET_LOCKED'`: both resurface functions' candidate queries, drill-down, the recall-time routine collapse (a group with a currently-locked member does not collapse), and Demo 3's Q4/Q6 | cue test asserts m32 unmoved, unstaged, unnamed; synthetic locked-buried sense test; runtime-relock drill-down + collapse tests |
+| B3 | Provenance wiring was order-sensitive: listing child m48 before parent m01 silently created zero DERIVED_FROM edges (audit 60/61), and the demo printed "every memory is backed" unconditionally, over a hop-capped (`*1..5`) audit query | Build wires provenance in a second pass, after every Memory node exists, then *verifies*: each memory must carry exactly one in-partition DERIVED_FROM edge or be a registered cross-period child, else the build raises. Demo audit uses an unbounded path and prints an AUDIT FAILED verdict when orphans > 0; the two display walks in Demo 5 were uncapped too | child-before-parent rebuild test (61/61 reachable, m48 → m01); demo source scan |
+| B4 | Recall composed text at runtime: HAZY content was the stored haze rendering *plus* a runtime marker, FRAGMENT content was shard + " (a shard, not the story)", AFFECT content was a composed sentence, SUNK content was gist + a runtime suffix — none of it equal to any stored string | Recall now only ever selects: AFFECT content is `None` (the rung has no text by design), FRAGMENT is the stored shard verbatim, HAZY is the stored haze rendering verbatim, SUNK (include_sunk) is the stored gist verbatim, a sunk routine collapse yields the Routine's stored gist. Demo narration that used to live inside the quotes moved outside them | universal sweep test: every recall row's content is `None` or byte-equal to a stored rendering of that node; staged-rows verbatim test |
+| S1 | Demo 4's printed model omitted the surprise encoding factor the code (and README) apply | Demo 4's header now prints `× (1 + 0.6 × surprise)`; the formula itself was already correct and is unchanged | source scan |
+| S2 | Burial discipline had four holes: `reinforce` raised a buried memory by ID (m43: frozen 0.721 → 0.878, no cue); `_bury_pass` had no date predicate (advancing to 2026-01-15 buried m52, recorded 2026-02-09 — a memory buried before it existed); the frozen strength depended on step size (0.721 one jump vs 0.968 in steps); `period_emergence` returned buried memories' shards | `reinforce` refuses buried memories (ValueError — only a cue raises the buried); burial requires `recorded_at <= to_date`; `_advance_in` buries *before* decaying, so the frozen strength is exactly the encoded strength, step-size independent; period emergence excludes buried (and sunk/staged) shards | four tests: raise-refusal, future-memory, frozen == encoded under both step patterns, period-emergence exclusion |
+| S3 | Flags and bands could disagree: a diluted resurface left a memory at strength 0.10 with `sunk = false`, and `default_recall` returned its full text; period recall ignored sunk entirely; spreading-activation step records carried shard+gist already at the AFFECT level | Resurface writes the sunk flag from the entry strength in the same write; `default_recall` filters by flag *and* strength and shapes HAZY hits to their stored haze rendering; period recall excludes sunk/staged; activation steps carry only what their level has surfaced (AFFECT: shard/gist are `None`) | diluted-resurface consistency test; default_recall haze-shaping test; recall_period sunk-exclusion test; step-gating test |
+| S4 | Routine grouping: the group id omitted the pathway, so two pathways at one place overwrote each other; one outlier weight rejected a whole bucket (4 joyful at 1.2 + 1 tender at 1.5 → no routine); the summary counted members as "days" | Group id is `routine-<period>-<pathway>-<place>` (shipped group is now `routine-p2-standard-harbor-bookstore`); within a bucket, a deterministic sliding window picks the largest weight-agreeing subset (≥ 4); the summary counts distinct event dates | two-pathways test (2 Routines built); mixed-weight subset test; distinct-days text test |
+| S5 | Cue degree counted graph *landings* (memories + periods), so a cue bound to 2 buried memories and 1 period had energy 1/3 and could only stir them — the spec divides among memories | Resurfacing divides by distinct bound *memories* (`cue_memory_degree`); the node-degree energy (`cue_energy`) remains what spreading activation injects by. Shipped data unaffected (no label is both a period cue and a memory cue) | synthetic test: degree 3, memory degree 2, energy 0.5 lifts both |
+| S6 | Builder trusted the dataset blindly: a derived memory whose `source_event` disagreed with its chain root was silently encoded from one event and filed under another; two period names slugifying alike ("Chapter A" / "Chapter A!") mapped to one directory and the second build cleared the first's store | Build validates chain/source_event consistency up front (mismatch → ValueError, nothing built); slug collisions are disambiguated with the period id, and the disambiguated slug is what the Period nodes carry | mismatch-rejection test; slug-collision test (both chapters intact, distinct slugs) |
+| S7 | Determinism was empirical, not structural: set iteration fed bridge collection, first-arrival won exact echo ties (via_person could differ across processes), recall ties fell back to database row order | Sorted iteration everywhere it feeds output; echo ties break by (person, source); recall and period sorts tie-break by id. A crafted two-bridge tie now resolves to the lexicographic winner in every process | tie-break test; subprocess test running the same trace under PYTHONHASHSEED=0 and =42 with byte-identical output |
+| S8 | Demo 3 answers outran their traversals: Q2 took the place from an arbitrary scarf event (the dataset happens to contain exactly one); Q5 called Priya the "introducer" when the graph only proves presence; Q6 patched the item name with `.replace(" tin", "")` | Q2 identifies the giving event (item involved *and* June present, earliest first); Q5 asks only what the traversal proves ("Who was with Theo on his first night at the chess club?"); Q6 returns the item's real name, "mint tea tin" | demo diff备案 below; graph side still 6/6 |
+| S9 | `requirements.txt` said `relate-db>=1.2` — unpinned | Pinned to the verified version: `relate-db==1.2.0` | requirements test |
+| N1 | `recall(periods=[])` silently meant "all periods" (returned 8 hits) | An explicit empty list now searches nothing and returns `[]` | empty-periods test (with a non-empty control) |
+
+## Demo output changes （备案）
+
+Diffed against the pre-fix run, all three modes. Every change traces
+to a row of the table above; nothing else moved.
+
+- Demo 2(a): the naive section is now headed "TEACHING CONTRAST,
+  deliberately unfiltered … NOT a path the agent ever answers
+  through". Its content (the deliberate leak) is unchanged.
+- Demo 2(c), default run: was a silent unlock printing m30 in full;
+  now prints "(no --passphrase given: unlock not attempted)". With
+  `--passphrase mira-unlock-demo` the unlock prints exactly as
+  before; with a wrong passphrase, rejection as before.
+- Demo 3: Q5's question reworded (S8). The keyword baseline's top
+  hit for the reworded question changed, so the printed baseline
+  score moves 3/6 → 2/6; the graph side is 6/6 before and after.
+  Q6's graph answer is now the item's real name, "mint tea tin"
+  (still scored CORRECT against the expected substring).
+- Demo 4: the model header gains "× (1 + 0.6 × surprise)" (S1).
+  The locked-memories listing shows m32 at strength 1.000 instead
+  of 0.745 — the frozen-at-encoded value (S2).
+- Demo 5: the m30 unlock print is gone; the narration now states
+  the only path to its text is Demo 2's passphrase gate. All HAZY
+  quotations lose their runtime "(hazy — …)" markers and are the
+  stored renderings verbatim (B4). AFFECT rows print "(no content —
+  only the feeling is back: …)" instead of a composed sentence;
+  FRAGMENT rows quote the bare shard, with the gloss moved outside
+  the quotes. m43's frozen strength prints 0.968 (its encoded
+  strength) instead of 0.721 (S2). The June-resurface listing no
+  longer contains m32, and the closing note is rewritten: a locked
+  memory is not raised, not moved, not even named (B2). Final
+  counts move HAZY 21 → 20, BURIED 0 → 1 — m32 stays buried now.
+- Demos 1, 6, 7: byte-identical, including the Demo 7 dilution
+  numbers and the eight-mention rumination trajectory
+  (0.850 ×4 → 0.794 → 0.724 → 0.651 → 0.561).
+
+## Tests
+
+43 → **74**, all green. The 31 new tests live in
+`FixRegressionTest` (one class, one test per verified finding, plus
+controls). Three pre-existing assertions were updated to the
+corrected contracts, each because the fix *is* the behaviour change:
+the routine id gained its pathway segment (S4), and two buried-ladder
+tests now assert `content is None` at AFFECT / shard-verbatim at
+FRAGMENT instead of substring checks on composed text (B4).
+
+## Rebuild & release
+
+- `python build_graph.py` output is byte-identical to the pre-fix
+  build (61 memories, 478 edges, same per-chapter counts): every
+  finding was latent on the shipped dataset, so the shipped graph
+  did not change shape. `store.zip` was rebuilt from the new build
+  (62 entries, integrity-checked, opens and serves all 61
+  memories).
+- Clean-room check: a fresh directory + fresh venv, only the files
+  bound for the repository — install, build, demo (all three
+  passphrase modes), full test suite — all pass.
+
+## Design decisions & pitfalls (v1.7)
+
+- **"Not named by its rescue" is the privacy bar.** B2's subtlest
+  part was not the unburying — it was that the resurface *result
+  list* named the locked memory at all. Existence is content. Every
+  path out of the graph now answers the privacy question before the
+  relevance question.
+- **The AFFECT rung now returns `None`, and that is a feature.**
+  A composed marker sentence *looked* like the agent speaking; a
+  null cannot be mistaken for one. Zero fabrication is easier to
+  keep when the honest value has a different type from the
+  dishonest one.
+- **Bury before you decay.** The frozen-strength bug (S2) was an
+  ordering bug: decay ran first, so "frozen" meant "whatever was
+  left when the clock happened to stop". Burial is a decision
+  about the memory as it was *formed*; it now happens on the
+  un-decayed value, and the frozen strength equals the encoded
+  strength by construction, not by calibration.
+- **Verification before repair changed nothing about the fixes —
+  and everything about the report.** Each finding carried a line
+  number and a confident mechanism; two of them (S1's "README
+  formula wrong", S7's "traces diverge") were inaccurate in detail
+  while right in substance. Reproducing first is what let this
+  chapter state precisely which parts were wrong.
+- **A stale store can mask a breaking change.** The S4 group-id
+  change stranded a hardcoded copy of the old id in demo.py
+  (`ROUTINE_ID`). Every project-tree demo run still passed, because
+  Demo 7 opens the *shipped* store — which was still the pre-fix
+  build. The clean-room run (fresh venv, fresh build, no leftovers)
+  caught it in seconds. The demo now derives the group id from the
+  recall answer it just printed, and a regression test pins the
+  absence of any hardcoded group id in demo.py. Lesson recorded:
+  the clean-room check is not a formality; it is the only run that
+  cannot lie about leftovers.

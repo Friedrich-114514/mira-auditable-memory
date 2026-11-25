@@ -122,9 +122,10 @@ Three later mechanisms complete the picture (v1.6):
   with the habit; the days themselves are never deleted, and a
   drill-down (routine_drilldown) still reaches every one.
 
-  Cue dilution (see cue_energy): a sensory cue never decays, but
-  the energy it delivers to any one memory is divided by the number
-  of nodes it has been bound to. Reuse blunts the key.
+  Cue dilution (see cue_energy / cue_memory_degree): a sensory cue
+  never decays, but the energy it delivers to any one memory is
+  divided by the number of *memories* it has been bound to. Reuse
+  blunts the key.
 
   Rumination ceiling (see rumination_gain / RUMINATION_CAP): a
   grudge's rehearsals gain in full only a few times; the dividend
@@ -472,27 +473,36 @@ def _refresh_sunk(db) -> None:
     )
 
 
-def _bury_pass(db) -> None:
+def _bury_pass(db, to_date: str) -> None:
     """Push down the memories the mind refuses to keep on the surface.
 
     A buried-pathway memory (vulnerable / shame / fear) that was
     encoded strongly (encoded_strength >= BURY_ENCODED_MIN) is marked
-    buried at the first time advance after its formation. It does not
-    fade through the haze first — suppression is not decay. Its
-    strength is frozen from then on (advance skips buried memories):
-    the pain does not fade; it is held, unreachable, with its evidence
-    chain intact.
+    buried at the first time advance that reaches its formation —
+    and only then: the pass is date-bounded (recorded_at <= to_date),
+    so advancing time to *before* a memory was formed can never bury
+    a memory that does not exist yet (S2).
+
+    The pass runs *before* the decay of the same advance (see
+    _advance_in): suppression is not decay. A buried memory therefore
+    freezes at its encoded strength — the value cannot depend on how
+    large the first time jump happened to be (S2). Its strength is
+    frozen from then on (advance skips buried memories): the pain
+    does not fade; it is held, unreachable, with its evidence chain
+    intact.
     """
     db.execute(
         "MATCH (m:Memory) WHERE m.pathway = 'buried' AND m.buried = false "
         "AND m.buried_ever = false AND m.encoded_strength >= $min "
+        "AND m.recorded_at <= $to "
         "SET m.buried = true, m.buried_ever = true, m.sunk = false",
-        {"min": BURY_ENCODED_MIN},
+        {"min": BURY_ENCODED_MIN, "to": to_date},
     )
 
 
 def _advance_in(db, to_date: str) -> None:
     """Decay one chapter's memories up to `to_date`, inside its store."""
+    _bury_pass(db, to_date)
     groups = db.execute(
         "MATCH (m:Memory) WHERE m.buried = false "
         "RETURN DISTINCT m.strength_as_of AS d, m.emotion_weight AS w, "
@@ -510,7 +520,6 @@ def _advance_in(db, to_date: str) -> None:
             {"from": row["d"], "w": row["w"], "s": row["s"],
              "f": decay_factor(days, row["w"], row["s"]), "to": to_date},
         )
-    _bury_pass(db)
     _refresh_sunk(db)
 
 
@@ -518,10 +527,12 @@ def advance_time(lib, to_date: str) -> dict:
     """Decay every memory's strength up to `to_date`, chapter by chapter.
 
     Each chapter is aged inside its own store, in the index's
-    chronological order; buried memories are skipped (their strength
-    is frozen), and afterwards each chapter's bury pass pushes down
-    any newly eligible buried-pathway memories. Returns the
-    post-advance counts over the whole library.
+    chronological order. Inside a chapter the bury pass runs first —
+    a newly eligible buried-pathway memory is pushed down whole, at
+    its encoded strength, before any decay of this advance touches
+    the rest — and buried memories are skipped by decay from then on
+    (their strength is frozen). Returns the post-advance counts over
+    the whole library.
     """
     for db in lib.all_partitions():
         _advance_in(db, to_date)
@@ -542,11 +553,15 @@ def reinforce(lib, mem_id: str, on_date: str) -> dict:
     gain for the first few rehearsals, a halving dividend after that,
     a hard ceiling on what rehearsal can restore, and a
     `ruminate_count` on the node that counts every rehearsal.
+
+    A still-buried memory cannot be reinforced at all (ValueError):
+    its strength is frozen, and only a cue can raise it — after which
+    the resurfacing ladder is exactly what reinforce walks.
     """
     db = lib.db_for_memory(mem_id)
     rows = db.execute(
         "MATCH (m:Memory {id: $id}) RETURN m.strength AS s, "
-        "m.strength_as_of AS as_of, m.sunk AS sunk, "
+        "m.strength_as_of AS as_of, m.sunk AS sunk, m.buried AS buried, "
         "m.emotion_weight AS w, m.surprise AS surprise, "
         "m.pathway AS pathway, m.resurface_stage AS stage, "
         "m.ruminate_count AS ruminate_count",
@@ -554,6 +569,13 @@ def reinforce(lib, mem_id: str, on_date: str) -> dict:
     ).data()
     if not rows:
         raise KeyError(f"no memory with id {mem_id!r}")
+    if rows[0]["buried"]:
+        # A buried memory's strength is frozen and its only way back
+        # is a cue (cue_resurface / sense_resurface). A bare mention
+        # by id must not thaw it, boost it, or re-stamp it (S2).
+        raise ValueError(
+            f"memory {mem_id!r} is buried: only a cue can raise it "
+            "(cue_resurface / sense_resurface)")
     was_sunk = bool(rows[0]["sunk"])
     pathway = rows[0]["pathway"]
     ruminations = rows[0]["ruminate_count"] or 0
@@ -565,10 +587,16 @@ def reinforce(lib, mem_id: str, on_date: str) -> dict:
     stage = rows[0]["stage"]
     if stage is not None:
         new_stage = STAGE_FRAGMENT if stage == STAGE_AFFECT else None
+        # The stage moves, the strength does not — but the sunk flag
+        # is refreshed from that strength in the same write, so when
+        # the ladder clears onto a strength below the sinking line
+        # the flag already agrees with the band (S3).
         db.execute(
             "MATCH (m:Memory {id: $id}) SET m.resurface_stage = $stage, "
+            "m.sunk = $sunk, "
             "m.last_accessed = $d, m.strength_as_of = $d",
-            {"id": mem_id, "stage": new_stage, "d": on_date},
+            {"id": mem_id, "stage": new_stage, "d": on_date,
+             "sunk": rows[0]["s"] < SUNK_THRESHOLD},
         )
         current = db.execute(
             "MATCH (m:Memory {id: $id}) RETURN m.strength AS s",
@@ -579,7 +607,7 @@ def reinforce(lib, mem_id: str, on_date: str) -> dict:
             "pre": current,
             "post": current,
             "was_sunk": was_sunk,
-            "sunk": False,
+            "sunk": current < SUNK_THRESHOLD,
             "pathway": pathway,
             "gain": 0.0,
             "ruminate_count": ruminations,
@@ -665,19 +693,34 @@ def default_recall(lib, keyword: str) -> list:
     Two stacked hard filters: SECRET_LOCKED memories are excluded (the
     privacy rule from Demo 2, unchanged) *and* sunk memories are
     excluded (forgotten is forgotten — until something recalls them).
-    Chapters are searched in index order and the hits concatenated.
+    The sunk exclusion is applied twice over, by the flag *and* by
+    the strength itself, so the two can never disagree into a leak
+    (S3). Chapters are searched in index order and the hits
+    concatenated.
 
-    This is the low-level keyword helper Demo 4 uses; new code should
-    prefer `recall`, which shapes its answer by band.
+    The text a hit carries is band-shaped, like the unified recall's:
+    full text in the CLEAR band, the memory's own stored haze
+    rendering in the HAZY band. This is the low-level keyword helper
+    Demo 4 uses; new code should prefer `recall`, which also ranks
+    and stages its answer.
     """
-    return lib.execute_all(
+    rows = lib.execute_all(
         "MATCH (m:Memory) WHERE m.privacy <> 'SECRET_LOCKED' "
         "AND m.sunk = false AND m.buried = false "
+        "AND m.strength >= $t "
         "AND m.resurface_stage IS NULL "
         "AND toLower(m.text) CONTAINS $kw "
-        "RETURN m.id AS id, m.text AS text, m.strength AS strength",
-        {"kw": keyword.lower()},
+        "RETURN m.id AS id, m.text AS text, m.strength AS strength, "
+        "m.haze1 AS haze1, m.haze2 AS haze2, m.haze3 AS haze3",
+        {"kw": keyword.lower(), "t": SUNK_THRESHOLD},
     )
+    for row in rows:
+        if band_of(row["strength"]) == BAND_HAZY:
+            _form, field = _HAZE_FORMS[haze_level(row["strength"])]
+            row["text"] = row[field]
+        for field in ("haze1", "haze2", "haze3"):
+            row.pop(field, None)
+    return rows
 
 
 def band_of(strength: float) -> str:
@@ -705,14 +748,13 @@ def haze_level(strength: float) -> int | None:
     return 3
 
 
-# form, stored rendering property, marker — one entry per haze level.
+# form, stored rendering property — one entry per haze level. The
+# recall entry's band/level/form fields carry the "this is hazy"
+# signal; the content itself is the stored rendering, verbatim (B4).
 _HAZE_FORMS = {
-    1: ("frayed", "haze1",
-        "(hazy — the lightest details have faded)"),
-    2: ("thinned", "haze2",
-        "(hazy — only the heaviest details remain)"),
-    3: ("outline", "haze3",
-        "(hazy — only the outline and its anchor detail remain)"),
+    1: ("frayed", "haze1"),
+    2: ("thinned", "haze2"),
+    3: ("outline", "haze3"),
 }
 
 
@@ -743,6 +785,10 @@ def recall(lib, keyword: str, *, unlocked: bool = False,
     In every hazy layer the detail fields are withheld (details is
     None) and the content is one of the renderings stored when the
     memory was fresh — selected, never rewritten at recall time.
+    The content is always *exactly* one stored string, verbatim (or
+    None at the AFFECT rung, where by design no text exists yet);
+    status lives in the band / level / form fields, never spliced
+    into the returned text.
     Which details survive into which layer is decided by the memory's
     own detail weights (build_graph.detail_inventories): details fall
     in order of weight, not of kind.
@@ -763,7 +809,7 @@ def recall(lib, keyword: str, *, unlocked: bool = False,
     returns the un-merged members, which is how the demo shows the
     before/after.
     """
-    pids = periods if periods else lib.period_order
+    pids = periods if periods is not None else lib.period_order
     rows = []
     for pid in pids:
         db = lib.partition(pid)
@@ -815,24 +861,26 @@ def recall(lib, keyword: str, *, unlocked: bool = False,
             "period": row["_pid"],
         }
         if row["stage"] == STAGE_AFFECT:
-            # The feeling is back; nothing else is. No text, no gist,
-            # no shard — only the emotion and its valence.
+            # The feeling is back; nothing else is. There is no text
+            # at this rung — not even a stored one — so content is
+            # None and the emotion/valence fields carry everything
+            # recall is allowed to say (B4: recall never composes
+            # sentences of its own).
             out.append({
                 **common,
                 "level": None,
                 "form": "affect",
-                "content": "(something about this stirs a feeling — "
-                           "the feeling is back, the story is not)",
+                "content": None,
                 "details": None,
             })
         elif row["stage"] == STAGE_FRAGMENT:
             # One isolated shard — a place, an object, half a moment —
-            # floating free of any outline. A shard, not the story.
+            # floating free of any outline. The stored shard, verbatim.
             out.append({
                 **common,
                 "level": None,
                 "form": "fragment",
-                "content": f"{row['shard']} (a shard, not the story)",
+                "content": row["shard"],
                 "details": None,
             })
         elif band == BAND_CLEAR:
@@ -849,12 +897,12 @@ def recall(lib, keyword: str, *, unlocked: bool = False,
             })
         elif band == BAND_HAZY:
             level = haze_level(row["strength"])
-            form, field, marker = _HAZE_FORMS[level]
+            form, field = _HAZE_FORMS[level]
             out.append({
                 **common,
                 "level": level,
                 "form": form,
-                "content": f"{row[field]} {marker}",
+                "content": row[field],
                 "details": None,
             })
         elif include_sunk:  # SUNK, surfaced only on explicit request
@@ -862,11 +910,12 @@ def recall(lib, keyword: str, *, unlocked: bool = False,
                 **common,
                 "level": None,
                 "form": "gist",
-                "content": f"{row['gist']} "
-                           "(sunk — surfaced only because include_sunk was set)",
+                "content": row["gist"],
                 "details": None,
             })
-    out.sort(key=lambda r: r["priority"], reverse=True)
+    # Priority descending; ties broken by id so the order is a pure
+    # function of the graph, never of database row order (S7).
+    out.sort(key=lambda r: (-r["priority"], r["id"]))
     if routines:
         out = _collapse_routines(lib, out)
     return out
@@ -882,6 +931,13 @@ def _collapse_routines(lib, entries: list) -> list:
     strength and priority; its content is the Routine node's stored
     rendering — the full text, or the gist alone when even the
     strongest member is sunk (the include_sunk path).
+
+    Privacy: if any member of the group is *currently* SECRET_LOCKED,
+    the group does not collapse at all. The stored summary names the
+    group's days, and a day that has since been locked must not be
+    summarised into a casually returned node — the surviving members
+    answer individually instead (the locked one is already filtered
+    out of the entries themselves).
     """
     groups: dict[str, list] = {}
     for entry in entries:
@@ -894,6 +950,13 @@ def _collapse_routines(lib, entries: list) -> list:
         if len(members) < 2:
             continue
         pid = members[0]["period"]
+        locked = lib.partition(pid).execute(
+            "MATCH (r:Routine {id: $rid})-[:SUMMARIZES]->(m:Memory) "
+            "WHERE m.privacy = 'SECRET_LOCKED' RETURN count(m) AS c",
+            {"rid": rid},
+        ).data()[0]["c"]
+        if locked:
+            continue
         rows = lib.partition(pid).execute(
             "MATCH (r:Routine {id: $rid}) RETURN r.text AS text, "
             "r.gist AS gist, r.place AS place, "
@@ -906,8 +969,7 @@ def _collapse_routines(lib, entries: list) -> list:
         node = rows[0]
         strongest = max(members, key=lambda e: e["priority"])
         if strongest["band"] == BAND_SUNK:
-            content = (f"{node['gist']} (sunk — surfaced only because "
-                       f"include_sunk was set)")
+            content = node["gist"]
         else:
             content = node["text"]
         routine_entries.append({
@@ -939,7 +1001,7 @@ def _collapse_routines(lib, entries: list) -> list:
         return entries
     merged = [e for e in entries if e["id"] not in suppressed]
     merged.extend(routine_entries)
-    merged.sort(key=lambda r: r["priority"], reverse=True)
+    merged.sort(key=lambda r: (-r["priority"], r["id"]))
     return merged
 
 
@@ -950,6 +1012,12 @@ def routine_drilldown(lib, routine_id: str) -> list:
     about a *day* and every day is still there — id, source-event
     date, full text, current strength and band, read from the
     chapter that holds the routine.
+
+    Privacy is checked against the members' *current* state, like
+    every other content path: a member locked after the routine was
+    built drops out of the drill-down until it is unlocked again.
+    (Build-time grouping already excludes locked episodes; this
+    covers a lock that lands later.)
     """
     pid = None
     for cand in lib.period_order:
@@ -965,6 +1033,7 @@ def routine_drilldown(lib, routine_id: str) -> list:
     rows = lib.partition(pid).execute(
         "MATCH (r:Routine {id: $rid})-[:SUMMARIZES]->(m:Memory), "
         "(m)-[:DERIVED_FROM*1..5]->(e:Event) "
+        "WHERE m.privacy <> 'SECRET_LOCKED' "
         "RETURN m.id AS id, e.date AS date, m.text AS text, "
         "m.strength AS strength ORDER BY date",
         {"rid": routine_id},
@@ -981,28 +1050,53 @@ def routine_drilldown(lib, routine_id: str) -> list:
 def cue_degree(lib, cue_label: str) -> int:
     """How many nodes a sensory cue is bound to, across the library.
 
-    Counts TRIGGERED_BY edges into Cue nodes with this label in every
-    chapter — memories and periods alike. A cue bound once is a key
-    cut for one lock; a cue bound twenty times is wallpaper.
+    Counts distinct nodes with a TRIGGERED_BY edge to a Cue node with
+    this label, in every chapter — memories and periods alike. This
+    is the *landing* count: it drives the injection strength of
+    spreading activation, where a cue bound to many nodes lands
+    softer on each of them. A cue bound once is a key cut for one
+    lock; a cue bound twenty times is wallpaper.
     """
     rows = lib.execute_all(
         "MATCH (n)-[:TRIGGERED_BY]->(c:Cue {label: $label}) "
-        "RETURN count(n) AS c",
+        "RETURN count(DISTINCT n) AS c",
+        {"label": cue_label},
+    )
+    return sum(r["c"] for r in rows)
+
+
+def cue_memory_degree(lib, cue_label: str) -> int:
+    """How many *memories* a sensory cue is bound to, across the library.
+
+    This is the dilution denominator for a cue's effect on memories
+    (sense_resurface): a Period the cue also happens to be bound to
+    is not a memory competing for the same charge, and must not blunt
+    the key (S5). Distinct Memory nodes only — a duplicate edge to
+    the same memory does not dilute twice.
+    """
+    rows = lib.execute_all(
+        "MATCH (m:Memory)-[:TRIGGERED_BY]->(c:Cue {label: $label}) "
+        "RETURN count(DISTINCT m) AS c",
         {"label": cue_label},
     )
     return sum(r["c"] for r in rows)
 
 
 def cue_energy(lib, cue_label: str) -> float:
-    """The activation energy a cue delivers to ONE of its memories.
+    """The activation a cue delivers per node it lands on.
 
     The cue itself never decays — the song is still the song. But its
-    energy is divided among everything it has been bound to since:
-    energy = CUE_BASE_ENERGY / degree. Hear a song once in three
-    years and it is a lightning strike; set it as your morning alarm
-    and it is just a sound. (Gemini's critique, adopted: in reality
-    cues do not stay sharp — they are diluted by reuse, and the
-    1/degree law is the mechanisation.)
+    charge is divided among the nodes it has been bound to since:
+    energy = CUE_BASE_ENERGY / cue_degree (the bound-*node* count).
+    This is the spreading-activation injection energy (see
+    spreading_activation): a cue bound to many nodes lands softer on
+    each. Hear a song once in three years and it is a lightning
+    strike; set it as your morning alarm and it is just a sound.
+    (Gemini's critique, adopted: in reality cues do not stay sharp —
+    they are diluted by reuse, and the 1/degree law is the
+    mechanisation.) For a cue's effect on *memories* specifically,
+    the denominator is the memory count instead — see
+    cue_memory_degree and sense_resurface (S5).
     """
     degree = cue_degree(lib, cue_label)
     return CUE_BASE_ENERGY / degree if degree else 0.0
@@ -1026,12 +1120,19 @@ def _resurface_in(db, mem_id: str, on_date: str, via: str,
     sinking line, so the feeling and the shard surface, and then,
     unless life mentions it again in time, it slips back under before
     the story can assemble.
+
+    The sunk flag is set from the entry strength in the same write,
+    so the flag and the numerical band can never disagree (S3): a
+    memory set down at 0.10 *is* sunk, even while its resurfacing
+    stage still lets the feeling show.
     """
     db.execute(
-        "MATCH (m:Memory {id: $id}) SET m.buried = false, m.sunk = false, "
+        "MATCH (m:Memory {id: $id}) SET m.buried = false, "
+        "m.sunk = $sunk, "
         "m.strength = $s, m.strength_as_of = $d, m.last_accessed = $d, "
         "m.resurface_stage = $stage",
         {"id": mem_id, "s": entry_strength, "d": on_date,
+         "sunk": entry_strength < SUNK_THRESHOLD,
          "stage": STAGE_AFFECT},
     )
     row = db.execute(
@@ -1064,6 +1165,11 @@ def cue_resurface(lib, on_date: str, *, person: str = None,
     APPEARS_IN edges say which chapters it appears in, and only those
     chapters are opened. Each result carries its "period" — a person
     can call a memory back from a chapter the cue-giver never visited.
+
+    Privacy outranks resurfacing: SECRET_LOCKED memories are not
+    candidates. A cue neither raises them, nor names them, nor moves
+    their state — secrecy and suppression stack, and the lock is the
+    outer wall (B2).
     """
     candidates = set()
     if person:
@@ -1084,6 +1190,7 @@ def cue_resurface(lib, on_date: str, *, person: str = None,
             rows = db.execute(
                 "MATCH (m:Memory)-[:DERIVED_FROM*1..5]->(e:Event)-[:WITH]->"
                 "(p:Person {name: $name}) WHERE m.buried = true "
+                "AND m.privacy <> 'SECRET_LOCKED' "
                 "RETURN DISTINCT m.id AS id",
                 {"name": person},
             ).data()
@@ -1093,14 +1200,16 @@ def cue_resurface(lib, on_date: str, *, person: str = None,
             rows = db.execute(
                 "MATCH (m:Memory)-[:DERIVED_FROM*1..5]->(e:Event)"
                 "-[:EXPERIENCED_AT]->(pl:Place {name: $name}) "
-                "WHERE m.buried = true RETURN DISTINCT m.id AS id",
+                "WHERE m.buried = true AND m.privacy <> 'SECRET_LOCKED' "
+                "RETURN DISTINCT m.id AS id",
                 {"name": place},
             ).data()
             for r in rows:
                 found[r["id"]] = (pid, f"place:{place}")
         if item:
             rows = db.execute(
-                "MATCH (m:Memory) WHERE m.buried = true AND ("
+                "MATCH (m:Memory) WHERE m.buried = true "
+                "AND m.privacy <> 'SECRET_LOCKED' AND ("
                 "EXISTS { (m)-[:INVOLVES]->(:Item {name: $name}) } OR "
                 "EXISTS { (m)-[:DERIVED_FROM*1..5]->(:Event)-[:INVOLVES]->"
                 "(:Item {name: $name}) }) RETURN m.id AS id",
@@ -1129,24 +1238,30 @@ def sense_resurface(lib, cue_label: str, on_date: str) -> list:
     resurfaced by sense bypassed the haze on the way down, but it
     returns through it.
 
-    Dilution: the cue's energy is divided among everything it is
-    bound to (cue_energy = 1 / degree), and the energy decides what
-    the firing can do. A sunk memory is raised at entry strength
+    Dilution: the cue's energy is divided among the *memories* it is
+    bound to (cue_memory_degree = distinct Memory nodes; a Period
+    binding does not compete for the charge), and the energy decides
+    what the firing can do. A sunk memory is raised at entry strength
     RESURFACE_STRENGTH x energy — a diluted cue sets it down low, and
     it can slip back under before its ladder is climbed. A *buried*
     memory is stricter: suppression only breaks at energy >=
     BURY_MIN_ENERGY; below that the cue reaches it but cannot raise
     it — the result is reported as stirred (raised = False), and the
     memory stays exactly where suppression put it.
+
+    Privacy outranks the cue, exactly as on the life-cue path:
+    SECRET_LOCKED memories are not selected at all — not raised, not
+    stirred, not named (B2).
     """
-    degree = cue_degree(lib, cue_label)
+    degree = cue_memory_degree(lib, cue_label)
     energy = CUE_BASE_ENERGY / degree if degree else 0.0
     out = []
     for pid in lib.periods_for_cue(cue_label):
         db = lib.partition(pid)
         rows = db.execute(
             "MATCH (m:Memory)-[:TRIGGERED_BY]->(c:Cue {label: $label}) "
-            "WHERE m.buried = true OR m.sunk = true "
+            "WHERE (m.buried = true OR m.sunk = true) "
+            "AND m.privacy <> 'SECRET_LOCKED' "
             "RETURN m.id AS id, m.buried AS was_buried, "
             "m.emotion AS emotion, m.valence AS valence, "
             "m.pathway AS pathway",
@@ -1218,6 +1333,7 @@ def _recall_period_in(db, period_id: str) -> dict:
     mems = db.execute(
         "MATCH (m:Memory)-[:PART_OF]->(p:Period {id: $pid}) "
         "WHERE m.buried = false AND m.privacy <> 'SECRET_LOCKED' "
+        "AND m.sunk = false AND m.resurface_stage IS NULL "
         "RETURN m.id AS id, m.gist AS gist, m.strength AS strength, "
         "m.emotion_weight AS emotion_weight, m.pathway AS pathway, "
         "m.emotion AS emotion",
@@ -1225,7 +1341,7 @@ def _recall_period_in(db, period_id: str) -> dict:
     ).data()
     for mem in mems:
         mem["priority"] = _priority(mem)
-    mems.sort(key=lambda r: r["priority"], reverse=True)
+    mems.sort(key=lambda r: (-r["priority"], r["id"]))
     period["memories"] = [
         {"id": m["id"], "gist": m["gist"], "emotion": m["emotion"],
          "priority": m["priority"]}
@@ -1274,7 +1390,8 @@ def period_emergence(lib, cue_label: str) -> dict | None:
         period = rows[0]
         frags = db.execute(
             "MATCH (m:Memory)-[:PART_OF]->(p:Period {id: $pid}) "
-            "WHERE m.privacy <> 'SECRET_LOCKED' "
+            "WHERE m.privacy <> 'SECRET_LOCKED' AND m.buried = false "
+            "AND m.sunk = false AND m.resurface_stage IS NULL "
             "RETURN m.id AS id, m.shard AS shard, m.strength AS strength, "
             "m.emotion_weight AS emotion_weight, m.pathway AS pathway "
             "ORDER BY m.id",
@@ -1282,7 +1399,7 @@ def period_emergence(lib, cue_label: str) -> dict | None:
         ).data()
         for frag in frags:
             frag["priority"] = _priority(frag)
-        frags.sort(key=lambda r: r["priority"], reverse=True)
+        frags.sort(key=lambda r: (-r["priority"], r["id"]))
         full = _recall_period_in(db, period["id"])
         return {
             "period": period["name"],
@@ -1403,7 +1520,7 @@ def spreading_activation(lib, cue_label: str, max_rounds: int = 10) -> dict:
         adj.setdefault(b, []).append((a, factor))
 
     mem_ids = {m["id"] for m in mems}
-    for mid in mem_ids:
+    for mid in sorted(mem_ids):
         if mid in mem_period:
             link(("m", mid), ("p", mem_period[mid]),
                  SPREAD_FACTORS["part_of"])
@@ -1419,7 +1536,10 @@ def spreading_activation(lib, cue_label: str, max_rounds: int = 10) -> dict:
     for mid, people in about.items():
         if mid not in mem_ids:
             continue
-        for person in people:
+        # Sorted: set iteration order is hash-seed dependent, and the
+        # bridge collection below must be a pure function of the
+        # graph — same graph, same trace, in every process (S7).
+        for person in sorted(people):
             if person != SELF_PERSON:
                 by_person.setdefault(person, []).append(mid)
     bridge_pairs = []   # (a, b, person): shared-person links that
@@ -1473,11 +1593,19 @@ def spreading_activation(lib, cue_label: str, max_rounds: int = 10) -> dict:
                         (2, ACT_FRAGMENT, "fragment"),
                         (3, ACT_GIST, "gist")):
                     if a >= threshold and reached < lvl:
+                        # A step carries only what its level has
+                        # actually surfaced: at AFFECT there is no
+                        # shard and no gist yet — returning them in
+                        # the record would hand over, at the feeling
+                        # stage, exactly what the ladder exists to
+                        # withhold (S3).
                         steps.append({
                             "round": round_no, "kind": "memory",
                             "id": key[1], "level": name, "activation": a,
-                            "shard": mem_by_id[key[1]]["shard"],
-                            "gist": mem_by_id[key[1]]["gist"],
+                            "shard": (mem_by_id[key[1]]["shard"]
+                                      if lvl >= 2 else None),
+                            "gist": (mem_by_id[key[1]]["gist"]
+                                     if lvl >= 3 else None),
                             "emotion": mem_by_id[key[1]]["emotion"],
                         })
                         reached = lvl
@@ -1532,13 +1660,20 @@ def spreading_activation(lib, cue_label: str, max_rounds: int = 10) -> dict:
     # BRIDGE_FACTOR = 0.165 of activation it stays below the AFFECT
     # threshold — an echo alone never brings another era back.
     echoes = {}
-    for a, b, person in bridge_pairs:
+    for a, b, person in sorted(bridge_pairs):
         for src, dst in ((a, b), (b, a)):
             src_act = act.get(("m", src), 0.0)
             if src_act <= 0:
                 continue
             value = src_act * SPREAD_FACTORS["about"] * BRIDGE_FACTOR
-            if value > echoes.get(dst, {}).get("activation", 0.0):
+            current = echoes.get(dst)
+            # Strongest echo wins; an exact tie is broken by
+            # (person, source) order, never by arrival order — the
+            # reported via_person is reproducible across processes.
+            if (current is None or value > current["activation"]
+                    or (value == current["activation"]
+                        and (person, src) < (current["via_person"],
+                                             current["from"]))):
                 echoes[dst] = {
                     "id": dst,
                     "period": mem_period.get(dst),

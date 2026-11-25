@@ -154,19 +154,26 @@ def demo_provenance(lib) -> None:
         if current_id is None:
             break
 
-    # Audit sweep: follow every memory's DERIVED_FROM chain (up to 5
-    # hops) and confirm each one terminates at a witnessed Event. The
-    # sweep fans out over the chapters — and every chain completes
-    # inside its own chapter, which the per-partition builds guarantee.
+    # Audit sweep: follow every memory's DERIVED_FROM chain to its
+    # end and confirm each one terminates at a witnessed Event. The
+    # path length is unbounded — a hop cap could misclassify a long
+    # legitimate chain as an orphan (B3). The sweep fans out over the
+    # chapters — and every chain completes inside its own chapter,
+    # which the per-partition builds guarantee.
     reachable = lib.execute_all(
-        "MATCH (m:Memory)-[:DERIVED_FROM*1..5]->(e:Event) RETURN DISTINCT m.id AS id"
+        "MATCH (m:Memory)-[:DERIVED_FROM*]->(e:Event) RETURN DISTINCT m.id AS id"
     )
     total_memories = len(lib.execute_all("MATCH (m:Memory) RETURN m.id AS id"))
     orphans = total_memories - len(reachable)
     print(f"\nAudit check: {len(reachable)}/{total_memories} memories trace back to a "
           f"source event; memories with NO provenance path: {orphans}")
-    print("Verdict: every memory in the graph is backed by a witnessed event.")
-    print("If there is no path, there is no memory — the agent cannot fabricate one.")
+    if orphans == 0:
+        print("Verdict: every memory in the graph is backed by a witnessed event.")
+        print("If there is no path, there is no memory — the agent cannot fabricate one.")
+    else:
+        print(f"Verdict: AUDIT FAILED — {orphans} memor"
+              f"{'y has' if orphans == 1 else 'ies have'} no provenance path. "
+              "The claim above does not hold for this graph.")
 
 
 # --------------------------------------------------------------------------
@@ -192,7 +199,9 @@ def demo_privacy(lib, passphrase: str | None) -> None:
     question = "What is Theo keeping in his desk drawer?"
     print(f"Question: {question}\n")
 
-    print("(a) NAIVE recall (no privacy filter — what a careless memory layer does):")
+    print("(a) NAIVE recall — TEACHING CONTRAST, deliberately unfiltered;")
+    print("    this is NOT a path the agent ever answers through. It shows")
+    print("    what a careless memory layer does with the same question:")
     for row in _drawer_search(lib, privacy_filter=False):
         print(f"  [{row['privacy']}] {row['id']}: \"{row['text']}\"")
     print("  -> LEAK: a locked secret is surfaced by an ordinary question.\n")
@@ -283,20 +292,27 @@ def graph_answers(lib) -> list[tuple[str, str, list[str]]]:
         ["June", "Lakeside Park"],
     ))
 
-    # Q2 — June's gift (the GAVE fact lives in the index) and the place
-    # of the event where she gave it (a chapter-local join)
+    # Q2 — June's gift (the GAVE fact lives in the index) and the
+    # place of the event where she gave it. The giving event is
+    # identified as such — an event that involves the item *and* has
+    # June present; the earliest one is the giving. (An arbitrary
+    # later event that merely involves the scarf would prove nothing
+    # about where it changed hands — S8.)
     item = lib.index.execute(
         "MATCH (june:Person {name: 'June'})-[:GAVE]->(i:Item) "
         "RETURN i.name AS item LIMIT 1"
     ).data()[0]["item"]
     rows = lib.execute_all(
         "MATCH (i:Item {name: $item})<-[:INVOLVES]-(e:Event)"
-        "-[:EXPERIENCED_AT]->(pl:Place) RETURN pl.name AS place",
+        "-[:EXPERIENCED_AT]->(pl:Place), "
+        "(e)-[:WITH]->(:Person {name: 'June'}) "
+        "RETURN pl.name AS place, e.date AS date",
         {"item": item},
     )
+    place = min(rows, key=lambda r: r["date"])["place"]
     out.append((
         "What did June give Theo, and where did she give it to him?",
-        f"a {item}, at the {rows[0]['place']}",
+        f"a {item}, at the {place}",
         ["red scarf", "Night Market"],
     ))
 
@@ -321,6 +337,7 @@ def graph_answers(lib) -> list[tuple[str, str, list[str]]]:
     rows = lib.execute_all(
         "MATCH (m:Memory {kind: 'plan'})-[:DERIVED_FROM]->(e:Event), "
         "(m)-[:INVOLVES]->(i:Item) WHERE 'hiking' IN e.tags "
+        "AND m.privacy <> 'SECRET_LOCKED' "
         "RETURN i.name AS item"
     )
     out.append((
@@ -329,7 +346,10 @@ def graph_answers(lib) -> list[tuple[str, str, list[str]]]:
         ["brass compass"],
     ))
 
-    # Q5 — earliest event at the chess club: who was with him (the introducer)
+    # Q5 — the earliest event at the chess club: who was with him?
+    # (The graph proves presence at his first night there; it does
+    # not prove who "introduced" him, so the question asks only what
+    # the traversal can actually show — S8.)
     evs = lib.execute_all(
         "MATCH (e:Event)-[:EXPERIENCED_AT]->(:Place {name: 'Chess Club Hall'}) "
         "RETURN e.id AS id, e.date AS date")
@@ -340,7 +360,7 @@ def graph_answers(lib) -> list[tuple[str, str, list[str]]]:
         {"id": ev_row["id"]},
     ).data()[0]["name"]
     out.append((
-        "Who introduced Theo to the chess club?",
+        "Who was with Theo on his first night at the chess club?",
         who,
         ["Priya"],
     ))
@@ -350,11 +370,12 @@ def graph_answers(lib) -> list[tuple[str, str, list[str]]]:
         "MATCH (m:Memory {kind: 'preference'})-[:DERIVED_FROM]->(e:Event), "
         "(e)-[:EXPERIENCED_AT]->(:Place {name: 'Café Lumen'}), "
         "(e)-[:WITH]->(:Person {name: 'Marco'}), (m)-[:INVOLVES]->(i:Item) "
+        "WHERE m.privacy <> 'SECRET_LOCKED' "
         "RETURN i.name AS item LIMIT 1"
     )
     out.append((
         "When Theo is at Café Lumen with Marco, what does he usually order?",
-        rows[0]["item"].replace(" tin", ""),
+        rows[0]["item"],
         ["mint tea"],
     ))
 
@@ -406,7 +427,8 @@ REUNIONS = {
 def demo_forgetting() -> None:
     section("DEMO 4 — FORGETTING CURVE: memories fade, sink, and can be recalled back")
     print("Model (decay.py): initial strength = confidence x salience of the")
-    print(f"source event; exponential decay, half-life {decay.HALF_LIFE_DAYS:.0f} days x the")
+    print("source event x (1 + 0.6 x the event's surprise); exponential decay,")
+    print(f"half-life {decay.HALF_LIFE_DAYS:.0f} days x the")
     print("memory's emotion_weight (emotion stretches or compresses the clock);")
     print(f"a recall reinforces s <- s + (1 - s) x {decay.REINFORCE_GAIN}; "
           f"below {decay.SUNK_THRESHOLD} a memory is SUNK.")
@@ -532,7 +554,17 @@ def _print_form(row, indent: str = "      ") -> None:
         label = row["stage"]
     else:
         label = row["band"] + (f"-{row['level']}" if row.get("level") else "")
+    if row["form"] == "affect":
+        # The AFFECT rung has no content at all — recall returns
+        # None there, and the demo says so instead of dressing a
+        # composed sentence up as the agent's answer (B4).
+        print(f"{indent}[{label} · strength {row['strength']:.3f}] "
+              f"(no content — only the feeling is back: "
+              f"{row['emotion']}, {row['valence']})")
+        return
     print(f"{indent}[{label} · strength {row['strength']:.3f}] \"{row['content']}\"")
+    if row["form"] == "fragment":
+        print(f"{indent}  (one isolated shard — not the story)")
     if row["form"] == "full":
         d = row["details"]
         print(f"{indent}  details: recorded {d['recorded_at']}, "
@@ -659,8 +691,9 @@ def demo_haze() -> None:
     print(f"  m30 sits at strength {m30['s']:.3f} — squarely in the CLEAR band —")
     print("  but it is SECRET_LOCKED, so band or no band, default recall for")
     hits = decay.recall(lib, "letter")
-    print(f"  'letter' returns {[h['id'] for h in hits]}. On the unlock path:")
-    _print_form(_recall_one(lib, "letter", "m30", unlocked=True))
+    print(f"  'letter' returns {[h['id'] for h in hits]}. And this demo does")
+    print("  not unlock it here: the only path to its text is Demo 2's")
+    print("  passphrase-gated one. Band membership is not access.")
 
     print("\nTwo longitudinal threads run through the summer:")
     print("  (a) a dual case — m12 (the scarf June gave him) vs m42 (Marco's")
@@ -760,7 +793,7 @@ def demo_haze() -> None:
     print(f"    recall 'honest', include_sunk -> "
           f"{[h['id'] for h in decay.recall(lib, 'honest', include_sunk=True)]}")
     scene = lib.db_for_memory("m43").execute(
-        "MATCH (m:Memory {id: 'm43'})-[:DERIVED_FROM*1..5]->(e:Event) "
+        "MATCH (m:Memory {id: 'm43'})-[:DERIVED_FROM*]->(e:Event) "
         "RETURN e.title AS title, e.date AS date LIMIT 1"
     ).data()[0]
     print(f"  ...but the audit walk still finds it: \"{scene['title']}\" "
@@ -775,8 +808,10 @@ def demo_haze() -> None:
     for r in resurfaced:
         print(f"    resurfaced {r['id']} via {r['via']} from {r['period']} "
               f"(emotion: {r['emotion']}) — enters at AFFECT")
-    print("  (m32 came up too — and stays invisible: SECRET_LOCKED outranks")
-    print("  resurfacing, exactly as it outranks everything.)")
+    print("  (m32 did not come up at all. It is SECRET_LOCKED, and the")
+    print("  cue path checks privacy like every other path: a locked")
+    print("  memory is not raised, not moved, not even named by its")
+    print("  rescue. Secrecy outranks resurfacing.)")
     print("  What recall can now say about m43 is only a feeling:")
     _print_form(_recall_one(lib, "honest", "m43"))
     for step_day, note in ((cue_day + timedelta(days=2), "a shard"),
@@ -799,7 +834,7 @@ def demo_haze() -> None:
     print(f"    recall 'toast', include_sunk -> "
           f"{[h['id'] for h in decay.recall(lib, 'toast', include_sunk=True)]}")
     scene = lib.db_for_memory("m52").execute(
-        "MATCH (m:Memory {id: 'm52'})-[:DERIVED_FROM*1..5]->(e:Event) "
+        "MATCH (m:Memory {id: 'm52'})-[:DERIVED_FROM*]->(e:Event) "
         "RETURN e.title AS title, e.date AS date LIMIT 1"
     ).data()[0]
     print(f"  The audit walk still finds it: \"{scene['title']}\" "
@@ -1037,9 +1072,6 @@ def demo_periods() -> None:
 # Demo 7: routine merging, cue dilution, the rumination ceiling
 # --------------------------------------------------------------------------
 
-ROUTINE_ID = "routine-p2-harbor-bookstore"
-
-
 def demo_habits_and_ceilings() -> None:
     section("DEMO 7 — HABITS & CEILINGS: the routine, the blunted key, "
             "the tired grudge")
@@ -1059,8 +1091,13 @@ def demo_habits_and_ceilings() -> None:
     print("  originals untouched, provenance chains intact — and daily")
     print("  recall now answers with the habit:")
     after = decay.recall(lib, "bookstore")
+    routine_id = None
     for row in after:
         if row["form"] == "routine":
+            # The drill-down below opens the very group this answer
+            # collapsed into — its id is read from the answer, never
+            # hardcoded, so a regrouped build cannot strand it.
+            routine_id = row["id"]
             info = row["routine"]
             print(f"    ROUTINE [{row['band']}] {row['content']}")
             print(f"      ({info['showing']} of {info['members']} days "
@@ -1072,7 +1109,7 @@ def demo_habits_and_ceilings() -> None:
     print("  The preference (m21) and the fact about Ana (m41) did NOT")
     print("  merge — only episodes are days, and only days become habit.")
     print("\n  Name a day, though, and the habit opens back up:")
-    for day in decay.routine_drilldown(lib, ROUTINE_ID):
+    for day in decay.routine_drilldown(lib, routine_id):
         print(f"    {day['date']}  {day['id']:<5} [{day['band']}] "
               f"{day['text'][:64]}")
     print("  Merged for remembering, never for auditing: every afternoon")
@@ -1162,13 +1199,20 @@ def demo_habits_and_ceilings() -> None:
 
 # --------------------------------------------------------------------------
 
-def main() -> None:
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--passphrase", default=DEMO_PASSPHRASE,
-                        help="Passphrase for the demo-2 unlock path.")
+    parser.add_argument(
+        "--passphrase", default=None,
+        help="Passphrase for the demo-2 unlock path. Opt-in: without "
+             "it the unlock is not attempted at all — the demo never "
+             "unlocks silently on a built-in default (B1).")
     parser.add_argument("--wrong-passphrase", action="store_true",
                         help="Demonstrate that a wrong passphrase is rejected.")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = _parser().parse_args()
 
     if not (STORE / "index").exists():
         print("Relate library not found. Run `python build_graph.py` first.",
