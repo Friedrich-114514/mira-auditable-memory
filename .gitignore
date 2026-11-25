@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Demo working stores — rebuilt fresh from data/memories.json on every
+# demo run. The persistent library in store/ IS tracked: it is the
+# inspectable deliverable.
+store_decay/
+store_haze/
+store_period/
+store_surprise/
+store_dilution/
+store_rumination/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
